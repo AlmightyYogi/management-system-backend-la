@@ -19,11 +19,13 @@ func SetupRoutes(r *gin.Engine, reportHandler *handler.ReportHandler, userHandle
 
 	auths := protected.Group("/register")
 	{
+		auths.POST("", userHandler.Register)
 		auths.POST("/", userHandler.Register)
 	}
 
 	accounts := protected.Group("/accounts")
 	{
+		accounts.GET("", userHandler.GetAllUsers)
 		accounts.GET("/", userHandler.GetAllUsers)
 		accounts.GET("/:uuid", userHandler.GetUserByUUID)
 		accounts.PUT("/:uuid", userHandler.UpdateUser)
@@ -31,7 +33,9 @@ func SetupRoutes(r *gin.Engine, reportHandler *handler.ReportHandler, userHandle
 
 	reports := protected.Group("/reports")
 	{
+		reports.POST("", reportHandler.CreateReport)
 		reports.POST("/", reportHandler.CreateReport)
+		reports.GET("", reportHandler.GetAllReports)
 		reports.GET("/", reportHandler.GetAllReports)
 		reports.GET("/export", reportHandler.ExportExcel)
 		reports.GET("/export-count", reportHandler.ExportCount)
@@ -48,7 +52,9 @@ func SetupRoutes(r *gin.Engine, reportHandler *handler.ReportHandler, userHandle
 
 	externalTeams := protected.Group("/report-external-teams")
 	{
+		externalTeams.GET("", externalTeamHandler.GetByReportID)
 		externalTeams.GET("/", externalTeamHandler.GetByReportID)
+		externalTeams.POST("", externalTeamHandler.CreateExternalTeam)
 		externalTeams.POST("/", externalTeamHandler.CreateExternalTeam)
 		externalTeams.PUT("/:id", externalTeamHandler.UpdateExternalTeam)
 		externalTeams.DELETE("/:id", externalTeamHandler.DeleteExternalTeam)
@@ -56,6 +62,7 @@ func SetupRoutes(r *gin.Engine, reportHandler *handler.ReportHandler, userHandle
 
 	masters := protected.Group("/master")
 	{
+		masters.GET("", masterHandler.GetAll)
 		masters.GET("/", masterHandler.GetAll)
 		masters.GET("/external-teams", masterHandler.GetExternalTeams)
 		masters.GET("/scopes", masterHandler.GetScopes)
