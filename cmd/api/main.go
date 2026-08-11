@@ -59,6 +59,8 @@ func main() {
 	externalTeamHandler := handler.NewReportExternalTeamHandler(externalTeamService)
 
 	r := gin.New()
+	r.RedirectTrailingSlash = false
+	r.RedirectFixedPath = false
 	r.MaxMultipartMemory = 50 << 20
 
 	r.Use(middleware.CORS())
