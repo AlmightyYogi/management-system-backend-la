@@ -3,8 +3,17 @@ package middleware
 import "github.com/gin-gonic/gin"
 
 func CORS() gin.HandlerFunc {
+	allowedOrigins := map[string]bool{
+		"http://localhost:5173":    true,
+		"http://10.49.192.13:9999": true,
+	}
+
 	return func(c *gin.Context) {
-		c.Writer.Header().Set("Access-Control-Allow-Origin", "http://localhost:5173")
+		origin := c.GetHeader("Origin")
+		if allowedOrigins[origin] {
+			c.Writer.Header().Set("Access-Control-Allow-Origin", origin)
+		}
+
 		c.Writer.Header().Set("Access-Control-Allow-Credentials", "true")
 		c.Writer.Header().Set("Access-Control-Allow-Headers", "Origin, Content-Type, Content-Length, Accept-Encoding, Authorization, Accept, X-Requested-With, Cache-Control")
 		c.Writer.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")

@@ -10,7 +10,7 @@ import (
 	"github.com/AlmightyOggy/management-system/internal/domain"
 )
 
-const appBaseURL = "http://localhost:5173"
+const appBaseURL = "http://10.49.192.13:9999"
 const appName    = "Management System"
 const teamName   = "B2B IT Operations Team"
 
