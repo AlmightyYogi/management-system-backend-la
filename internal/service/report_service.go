@@ -161,6 +161,23 @@ func (s *reportService) UpdateReport(
 		report.RCA = req.RCA
 	}
 
+	if req.CreatedAt != nil && *req.CreatedAt != "" {
+		parsedCreated, err := parseFlexibleTime(*req.CreatedAt)
+		if err != nil {
+			return nil, fmt.Errorf("invalid created_at: %v", err)
+		}
+		if parsedCreated.IsZero() {
+			return nil, errors.New("created_at tidak valid")
+		}
+		report.CreatedAt = parsedCreated
+
+		if report.ServicerestoredTime != nil {
+			diffSeconds := int64(math.Abs(report.ServicerestoredTime.Sub(parsedCreated).Seconds()))
+			report.RestoredTime = &diffSeconds
+			report.TotalInternalDuration = &diffSeconds
+		}
+	}
+
 	if req.Status != nil {
 		newStatus := *req.Status
 		oldStatus := report.Status
@@ -297,29 +314,46 @@ func isValidTime(t string) bool {
 	return err1 == nil && err2 == nil
 }
 
-func parseFlexibleTime(input string) (time.Time, error) {
-	formats := []string{
-		"2006-01-02 15:04",
-		"2006-01-02T15:04",
-		"2006-01-02 15:04:05",
-		"2006-01-02T15:04:05",
-		"02-01-2006 15:04",
-		"02/01/2006 15:04",
-		"01/02/2006 15:04",
-		"2006-01-02T15:04:05Z",
+func parseFlexibleTime(s string) (time.Time, error) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return time.Time{}, errors.New("empty time")
 	}
 
-	input = strings.TrimSpace(input)
+	loc, err := time.LoadLocation("Asia/Jakarta")
+	if err != nil {
+		loc = time.FixedZone("WIB", 7*3600)
+	}
 
-	for _, format := range formats {
-		if t, err := time.Parse(format, input); err == nil {
-			if !t.IsZero() {
+	formats := []string{
+		"2006-01-02T15:04:05Z07:00",
+		"2006-01-02T15:04:05Z",
+		"2006-01-02T15:04:05",
+		"2006-01-02T15:04",
+		"2006-01-02 15:04:05",
+		"2006-01-02 15:04",
+	}
+
+	if strings.Contains(s, "Z") || strings.Contains(s, "+") || (len(s) > 10 && strings.Count(s, "-") > 2) {
+		for _, f := range formats {
+			if t, err := time.Parse(f, s); err == nil {
 				return t, nil
 			}
 		}
 	}
 
-	return time.Time{}, fmt.Errorf("format waktu tidak dikenali: %s", input)
+	for _, f := range []string{
+		"2006-01-02T15:04:05",
+		"2006-01-02T15:04",
+		"2006-01-02 15:04:05",
+		"2006-01-02 15:04",
+	} {
+		if t, err := time.ParseInLocation(f, s, loc); err == nil {
+			return t, nil
+		}
+	}
+
+	return time.Time{}, fmt.Errorf("cannot parse time: %s", s)
 }
 
 func (s *reportService) ExportReports(filter repository.ReportFilter) ([]domain.Report, error) {
