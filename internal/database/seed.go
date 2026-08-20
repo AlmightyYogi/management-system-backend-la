@@ -21,9 +21,6 @@ func SeedMasterData(db *gorm.DB) {
 	assignedTo := []domain.MstAssignedTo{
 		{Name: "B2B Applications Operations", Description: "Tim B2B Apps Operations", IsActive: true},
 		{Name: "Application Owner (L3)", Description: "Application Owner Level 3", IsActive: true},
-		{Name: "B2B Apps Ops Support", Description: "B2B Apps Support", IsActive: true},
-		{Name: "App Owner", Description: "Application Owner", IsActive: true},
-		{Name: "App Owner/L3", Description: "Application Owner Level 3", IsActive: true},
 	}
 	seedMaster(db, "MstAssignedTo", assignedTo)
 
