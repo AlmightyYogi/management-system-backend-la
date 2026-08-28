@@ -14,6 +14,7 @@ type ReportRepository interface {
 	FindLastByPrefix(prefix string) (*domain.Report, error)
 	CountWithFilters(filter ReportFilter) (int64, error)
 	FindAllForExport(filter ReportFilter) ([]domain.Report, error)
+	DeleteByUUID(uuid string) error
 }
 
 type reportRepository struct {
@@ -128,4 +129,26 @@ func (r *reportRepository) FindAllForExport(filter ReportFilter) ([]domain.Repor
 		return nil, err
 	}
 	return reports, nil
+}
+
+func (r *reportRepository) DeleteByUUID(uuid string) error {
+	return r.db.Transaction(func(tx *gorm.DB) error {
+		var report domain.Report
+		if err := tx.Where("uuid = ?", uuid).First(&report).Error; err != nil {
+			return err
+		}
+
+		if err := tx.Where("report_id = ?", report.ID).Delete(&domain.ReportExternalTeam{}).Error; err != nil {
+			return err
+		}
+		// contoh chat/comment jika ada:
+		// if err := tx.Where("report_id = ?", report.ID).Delete(&domain.ReportComment{}).Error; err != nil {
+		// 	return err
+		// }
+
+		if err := tx.Delete(&report).Error; err != nil {
+			return err
+		}
+		return nil
+	})
 }

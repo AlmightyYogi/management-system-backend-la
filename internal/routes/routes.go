@@ -41,6 +41,7 @@ func SetupRoutes(r *gin.Engine, reportHandler *handler.ReportHandler, userHandle
 		reports.GET("/export-count", reportHandler.ExportCount)
 		reports.GET("/:uuid", reportHandler.GetReportByUUID)
 		reports.PUT("/:uuid", reportHandler.UpdateReport)
+		reports.DELETE("/:uuid", reportHandler.DeleteReport)
 		reports.POST("/:uuid/restore", reportHandler.MarkRestored)
 		reports.POST("/:uuid/toggle-handled", reportHandler.ToggleHandled)
 		reports.POST("/:uuid/rca/export", reportHandler.ExportRCA)

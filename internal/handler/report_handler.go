@@ -162,6 +162,25 @@ func (h *ReportHandler) UpdateReport(c *gin.Context) {
 	utils.Success(c, "Report updated successfully", report)
 }
 
+func (h *ReportHandler) DeleteReport(c *gin.Context) {
+	uuid := c.Param("uuid")
+	if uuid == "" {
+		utils.Error(c, http.StatusBadRequest, "UUID required", nil)
+		return
+	}
+
+	if err := h.reportService.DeleteReport(uuid); err != nil {
+		if err.Error() == "report not found" {
+			utils.Error(c, http.StatusNotFound, "Report not found", err)
+			return
+		}
+		utils.Error(c, http.StatusInternalServerError, "Failed to delete report", err)
+		return
+	}
+
+	utils.Success(c, "Report deleted successfully", nil)
+}
+
 func (h *ReportHandler) MarkRestored(c *gin.Context) {
 	uuid := c.Param("uuid")
 

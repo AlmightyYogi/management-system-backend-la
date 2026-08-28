@@ -21,6 +21,7 @@ type ReportService interface {
 	GetReportByUUID(uuidStr string) (*domain.Report, error)
 	GetAllReports(filter repository.ReportFilter) ([]domain.Report, int64, error)
 	CountReports(filter repository.ReportFilter) (int64, error)
+	DeleteReport(uuidStr string) error
 	MarkRestored(uuidStr string) (*domain.Report, error)
 	ToggleHandled(uuidStr string, handled bool) (*domain.Report, error)
 	GenerateIncidentCode(reportType string) string
@@ -256,6 +257,18 @@ func (s *reportService) CountReports(filter repository.ReportFilter) (int64, err
 
 func (s *reportService) GetReportByUUID(uuidStr string) (*domain.Report, error) {
 	return s.reportRepo.FindByUUID(uuidStr)
+}
+
+func (s *reportService) DeleteReport(uuidStr string) error {
+	_, err := s.reportRepo.FindByUUID(uuidStr)
+	if err != nil {
+		return errors.New("report not found")
+	}
+
+	if err := s.reportRepo.DeleteByUUID(uuidStr); err != nil {
+		return err
+	}
+	return nil
 }
 
 func (s *reportService) MarkRestored(uuidStr string) (*domain.Report, error) {
