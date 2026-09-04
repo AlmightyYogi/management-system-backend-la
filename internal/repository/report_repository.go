@@ -134,19 +134,22 @@ func (r *reportRepository) FindAllForExport(filter ReportFilter) ([]domain.Repor
 func (r *reportRepository) DeleteByUUID(uuid string) error {
 	return r.db.Transaction(func(tx *gorm.DB) error {
 		var report domain.Report
-		if err := tx.Where("uuid = ?", uuid).First(&report).Error; err != nil {
+		if err := tx.Unscoped().Where("uuid = ?", uuid).First(&report).Error; err != nil {
 			return err
 		}
 
-		if err := tx.Where("report_id = ?", report.ID).Delete(&domain.ReportExternalTeam{}).Error; err != nil {
+		// hapus data terkait dulu (sesuaikan model/tabel Anda)
+		if err := tx.Unscoped().
+			Where("report_id = ?", report.ID).
+			Delete(&domain.ReportExternalTeam{}).Error; err != nil {
 			return err
 		}
-		// contoh chat/comment jika ada:
-		// if err := tx.Where("report_id = ?", report.ID).Delete(&domain.ReportComment{}).Error; err != nil {
+		// contoh komentar/chat jika ada:
+		// if err := tx.Unscoped().Where("report_id = ?", report.ID).Delete(&domain.ReportComment{}).Error; err != nil {
 		// 	return err
 		// }
 
-		if err := tx.Delete(&report).Error; err != nil {
+		if err := tx.Unscoped().Delete(&report).Error; err != nil {
 			return err
 		}
 		return nil
