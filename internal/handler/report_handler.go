@@ -388,7 +388,7 @@ func (h *ReportHandler) ExportExcel(c *gin.Context) {
     _ = mergeRange
 
     headers := []string{
-        "No", "Incident Code", "Requestor", "Requestor Email",
+        "No", "Ticket Code", "Requestor", "Requestor Email",
         "Request Date", "Report Time", "Application", "Type",
         "Severity / Priority / Impact", "Assigned To", "Scope",
         "Description", "Resolution", "Root Cause Analysis (RCA)",
