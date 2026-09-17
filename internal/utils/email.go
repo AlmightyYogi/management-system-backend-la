@@ -346,6 +346,240 @@ func SendNewTicketNotification(report domain.Report) error {
 	return SendEmail(cfg.Email.AdminEmail, subject, htmlBody)
 }
 
+func SendVSSDelayAlert(ev domain.VSSDelayEvent, recipients []string) error {
+	cfg := config.GetConfig()
+	if cfg.Email.SMTPHost == "" {
+		return nil
+	}
+	if len(recipients) == 0 {
+		return nil
+	}
+
+	reasonLabel := vssReasonLabel(ev.Reason)
+	reasonColor := vssReasonColor(ev.Reason)
+
+	subject := fmt.Sprintf("[VSS ALERT] %s — %s (%s)",
+		reasonLabel, ev.DeviceName, ev.DeviceID)
+
+	monitorURL := fmt.Sprintf("%s/vss/delays?device_id=%s", appBaseURL, ev.DeviceID)
+
+	htmlBody := fmt.Sprintf(`<!DOCTYPE html>
+<html lang="id">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>VSS Alert</title>
+</head>
+<body style="margin:0;padding:0;background:#f3f4f6;font-family:'Segoe UI',Arial,sans-serif;">
+
+<table width="100%%" cellpadding="0" cellspacing="0" style="background:#f3f4f6;padding:32px 0;">
+  <tr>
+    <td align="center">
+      <table width="580" cellpadding="0" cellspacing="0" style="max-width:580px;width:100%%;background:#fff;border-radius:12px;overflow:hidden;box-shadow:0 4px 20px rgba(0,0,0,0.08);">
+
+        <!-- Header -->
+        <tr>
+          <td style="background:linear-gradient(135deg,#1e3a5f 0%%,#2563eb 100%%);padding:28px 32px;text-align:center;">
+            <div style="display:inline-block;background:rgba(255,255,255,0.15);border-radius:10px;padding:6px 18px;margin-bottom:12px;">
+              <span style="color:#fff;font-size:13px;font-weight:700;">%s</span>
+            </div>
+            <h1 style="color:#fff;margin:0;font-size:19px;font-weight:700;line-height:1.3;">
+              VSS Device Alert Detected
+            </h1>
+            <p style="color:rgba(255,255,255,0.75);margin:8px 0 0;font-size:13px;">
+              Monitor otomatis mendeteksi kondisi abnormal pada perangkat VSS
+            </p>
+          </td>
+        </tr>
+
+        <!-- Alert banner -->
+        <tr>
+          <td style="background:#fef2f2;border-left:4px solid %s;padding:14px 24px;">
+            <table cellpadding="0" cellspacing="0">
+              <tr>
+                <td style="font-size:18px;padding-right:10px;">⚠️</td>
+                <td style="font-size:13px;color:#991b1b;line-height:1.5;">
+                  <strong>%s</strong> pada device
+                  <strong>%s</strong> (%s).
+                  Harap segera dicek di VSS / lapangan.
+                </td>
+              </tr>
+            </table>
+          </td>
+        </tr>
+
+        <!-- Body -->
+        <tr>
+          <td style="padding:28px 32px;">
+            <p style="font-size:14px;color:#374151;margin:0 0 20px;line-height:1.6;">
+              Detail deteksi sebagai berikut. Gunakan informasi di bawah untuk investigasi.
+            </p>
+
+            <!-- Info card -->
+            <table width="100%%" cellpadding="0" cellspacing="0" style="background:#f8fafc;border:1px solid #e5e7eb;border-radius:8px;overflow:hidden;margin-bottom:24px;">
+              <tr>
+                <td style="padding:16px 20px;border-bottom:1px solid #e5e7eb;">
+                  <p style="margin:0;font-size:14px;font-weight:700;color:#111827;">Detail VSS Event</p>
+                </td>
+              </tr>
+              <tr>
+                <td style="padding:16px 20px;">
+                  <table cellpadding="0" cellspacing="0" width="100%%">
+                    <tr>
+                      <td style="font-size:13px;color:#6b7280;padding:6px 0;width:140px;">Detected At</td>
+                      <td style="font-size:13px;color:#111827;font-weight:600;padding:6px 0;">%s</td>
+                    </tr>
+                    <tr>
+                      <td style="font-size:13px;color:#6b7280;padding:6px 0;">Device ID</td>
+                      <td style="font-size:13px;color:#111827;font-weight:600;padding:6px 0;">%s</td>
+                    </tr>
+                    <tr>
+                      <td style="font-size:13px;color:#6b7280;padding:6px 0;">Device Name</td>
+                      <td style="font-size:13px;color:#111827;font-weight:600;padding:6px 0;">%s</td>
+                    </tr>
+                    <tr>
+                      <td style="font-size:13px;color:#6b7280;padding:6px 0;">Reason</td>
+                      <td style="font-size:13px;padding:6px 0;">
+                        <span style="display:inline-block;background:%s;color:#fff;font-size:11px;font-weight:700;padding:3px 10px;border-radius:10px;">%s</span>
+                      </td>
+                    </tr>
+                    <tr>
+                      <td style="font-size:13px;color:#6b7280;padding:6px 0;">Delay</td>
+                      <td style="font-size:13px;color:#111827;font-weight:600;padding:6px 0;">%d detik</td>
+                    </tr>
+                    <tr>
+                      <td style="font-size:13px;color:#6b7280;padding:6px 0;">DTU</td>
+                      <td style="font-size:13px;color:#111827;font-weight:600;padding:6px 0;">%s</td>
+                    </tr>
+                    <tr>
+                      <td style="font-size:13px;color:#6b7280;padding:6px 0;">Report Time</td>
+                      <td style="font-size:13px;color:#111827;font-weight:600;padding:6px 0;">%d</td>
+                    </tr>
+                    <tr>
+                      <td style="font-size:13px;color:#6b7280;padding:6px 0;">Is Later</td>
+                      <td style="font-size:13px;color:#111827;font-weight:600;padding:6px 0;">%v</td>
+                    </tr>
+                    <tr>
+                      <td style="font-size:13px;color:#6b7280;padding:6px 0;vertical-align:top;">Message</td>
+                      <td style="font-size:13px;color:#374151;padding:6px 0;line-height:1.5;">%s</td>
+                    </tr>
+                  </table>
+                </td>
+              </tr>
+            </table>
+
+            <!-- CTA -->
+            <table cellpadding="0" cellspacing="0" style="width:100%%;">
+              <tr>
+                <td align="center">
+                  <a href="%s" style="display:inline-block;padding:12px 32px;background:#2563eb;color:#fff;font-size:14px;font-weight:600;border-radius:8px;text-decoration:none;">
+                    Buka VSS Monitor →
+                  </a>
+                </td>
+              </tr>
+            </table>
+          </td>
+        </tr>
+
+        <!-- Footer -->
+        <tr>
+          <td style="padding:20px 32px;background:#f8fafc;border-top:1px solid #f1f5f9;">
+            <table width="100%%" cellpadding="0" cellspacing="0">
+              <tr>
+                <td>
+                  <p style="margin:0 0 4px;font-size:13px;font-weight:600;color:#374151;">Thank you,</p>
+                  <p style="margin:0;font-size:13px;color:#6b7280;">%s</p>
+                </td>
+                <td align="right" style="vertical-align:bottom;">
+                  <p style="margin:0;font-size:11px;color:#9ca3af;">
+                    Notifikasi otomatis dari VSS Monitor<br>
+                    %s
+                  </p>
+                </td>
+              </tr>
+            </table>
+          </td>
+        </tr>
+
+        <!-- Bottom bar -->
+        <tr>
+          <td style="background:#1e3a5f;padding:12px 32px;text-align:center;">
+            <p style="margin:0;font-size:11px;color:rgba(255,255,255,0.5);">
+              © %d %s · Automated Notification System
+            </p>
+          </td>
+        </tr>
+
+      </table>
+    </td>
+  </tr>
+</table>
+</body>
+</html>`,
+		appName,
+		reasonColor,
+		reasonLabel, ev.DeviceName, ev.DeviceID,
+		ev.DetectedAt,
+		ev.DeviceID,
+		ev.DeviceName,
+		reasonColor, reasonLabel,
+		ev.DelaySec,
+		ev.DTU,
+		ev.ReportTime,
+		ev.IsLater,
+		ev.Message,
+		monitorURL,
+		teamName,
+		time.Now().Format("02 Jan 2006 15:04 WIB"),
+		time.Now().Year(),
+		appName,
+	)
+
+	var lastErr error
+	for _, to := range recipients {
+		to = strings.TrimSpace(to)
+		if to == "" {
+			continue
+		}
+		if err := SendEmail(to, subject, htmlBody); err != nil {
+			lastErr = err
+		}
+	}
+	return lastErr
+}
+
+func vssReasonLabel(reason string) string {
+    switch strings.ToLower(reason) {
+    case "delayed":
+      return "Data Delayed (isLater)"
+    case "stale_timestamp":
+      return "Stale Timestamp"
+    case "no_heartbeat":
+      return "No Heartbeat"
+    case "disconnect":
+      return "WebSocket Disconnect"
+    case "storage_full":
+      return "Storage Full"
+    case "high_cpu":
+      return "High CPU"
+    default:
+      return reason
+    }
+}
+
+func vssReasonColor(reason string) string {
+    switch strings.ToLower(reason) {
+    case "delayed", "stale_timestamp":
+      return "#d97706"
+    case "no_heartbeat", "disconnect":
+      return "#dc2626"
+    case "storage_full", "high_cpu":
+      return "#7c3aed"
+    default:
+      return "#2563eb"
+    }
+}
+
 func SendEmail(to, subject, htmlBody string) error {
 	cfg := config.GetConfig()
 
@@ -375,4 +609,130 @@ func SendEmail(to, subject, htmlBody string) error {
 	}
 
 	return nil
+}
+
+func SendVSSDigestAlert(events []domain.VSSDelayEvent, recipients []string) error {
+	cfg := config.GetConfig()
+	if cfg.Email.SMTPHost == "" || len(events) == 0 || len(recipients) == 0 {
+		return nil
+	}
+
+	uniq := map[string]struct{}{}
+	for _, ev := range events {
+		uniq[ev.DeviceID] = struct{}{}
+	}
+
+	subject := fmt.Sprintf("[VSS Alert] %d event / %d device (digest) — %s",
+		len(events), len(uniq), time.Now().Format("02 Jan 2006 15:04"))
+
+	var rows strings.Builder
+	for _, ev := range events {
+		reasonColor := vssReasonColor(ev.Reason)
+		reasonLabel := vssReasonLabel(ev.Reason)
+		name := ev.DeviceName
+		if name == "" {
+			name = "-"
+		}
+		rows.WriteString(fmt.Sprintf(`
+			<tr>
+				<td style="padding:10px 12px;border-bottom:1px solid #f1f5f9;font-size:12px;color:#374151;">%s</td>
+				<td style="padding:10px 12px;border-bottom:1px solid #f1f5f9;font-size:12px;color:#111827;font-weight:600;">%s</td>
+				<td style="padding:10px 12px;border-bottom:1px solid #f1f5f9;font-size:12px;color:#6b7280;">%s</td>
+				<td style="padding:10px 12px;border-bottom:1px solid #f1f5f9;">
+					<span style="display:inline-block;background:%s;color:#fff;font-size:10px;font-weight:700;padding:2px 8px;border-radius:10px;">%s</span>
+				</td>
+				<td style="padding:10px 12px;border-bottom:1px solid #f1f5f9;font-size:12px;color:#111827;font-weight:600;">%ds</td>
+			</tr>`,
+			ev.DetectedAt,
+			name,
+			ev.DeviceID,
+			reasonColor,
+			reasonLabel,
+			ev.DelaySec,
+		))
+	}
+
+	htmlBody := fmt.Sprintf(`<!DOCTYPE html>
+<html lang="id">
+<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"></head>
+<body style="margin:0;padding:0;background:#f3f4f6;font-family:'Segoe UI',Arial,sans-serif;">
+<table width="100%%" cellpadding="0" cellspacing="0" style="background:#f3f4f6;padding:32px 0;">
+  <tr><td align="center">
+    <table width="640" cellpadding="0" cellspacing="0" style="max-width:640px;width:100%%;background:#fff;border-radius:12px;overflow:hidden;box-shadow:0 4px 20px rgba(0,0,0,0.08);">
+      <tr>
+        <td style="background:linear-gradient(135deg,#1e3a5f 0%%,#2563eb 100%%);padding:28px 32px;text-align:center;">
+          <div style="display:inline-block;background:rgba(255,255,255,0.15);border-radius:10px;padding:6px 18px;margin-bottom:12px;">
+            <span style="color:#fff;font-size:13px;font-weight:700;">%s</span>
+          </div>
+          <h1 style="color:#fff;margin:0;font-size:19px;font-weight:700;">VSS Alert Digest</h1>
+          <p style="color:rgba(255,255,255,0.75);margin:8px 0 0;font-size:13px;">
+            %d event dari %d device dalam jendela digest
+          </p>
+        </td>
+      </tr>
+      <tr>
+        <td style="background:#fef2f2;border-left:4px solid #dc2626;padding:14px 24px;">
+          <p style="margin:0;font-size:13px;color:#991b1b;line-height:1.5;">
+            Ringkasan otomatis. Detail lengkap ada di History VSS (database).
+          </p>
+        </td>
+      </tr>
+      <tr>
+        <td style="padding:24px 28px;">
+          <table width="100%%" cellpadding="0" cellspacing="0" style="border-collapse:collapse;border:1px solid #e5e7eb;border-radius:8px;overflow:hidden;">
+            <thead>
+              <tr style="background:#f8fafc;">
+                <th style="padding:10px 12px;text-align:left;font-size:11px;color:#6b7280;text-transform:uppercase;">Waktu</th>
+                <th style="padding:10px 12px;text-align:left;font-size:11px;color:#6b7280;text-transform:uppercase;">Name</th>
+                <th style="padding:10px 12px;text-align:left;font-size:11px;color:#6b7280;text-transform:uppercase;">Device ID</th>
+                <th style="padding:10px 12px;text-align:left;font-size:11px;color:#6b7280;text-transform:uppercase;">Reason</th>
+                <th style="padding:10px 12px;text-align:left;font-size:11px;color:#6b7280;text-transform:uppercase;">Delay</th>
+              </tr>
+            </thead>
+            <tbody>%s</tbody>
+          </table>
+          <table cellpadding="0" cellspacing="0" style="margin-top:24px;width:100%%;">
+            <tr><td align="center">
+              <a href="%s/vss/history" style="display:inline-block;padding:12px 28px;background:#2563eb;color:#fff;font-size:14px;font-weight:600;border-radius:8px;text-decoration:none;">Buka VSS History →</a>
+            </td></tr>
+          </table>
+        </td>
+      </tr>
+      <tr>
+        <td style="padding:20px 28px;background:#f8fafc;border-top:1px solid #f1f5f9;">
+          <p style="margin:0 0 4px;font-size:13px;font-weight:600;color:#374151;">Thank you,</p>
+          <p style="margin:0;font-size:13px;color:#6b7280;">%s</p>
+        </td>
+      </tr>
+      <tr>
+        <td style="background:#1e3a5f;padding:12px 28px;text-align:center;">
+          <p style="margin:0;font-size:11px;color:rgba(255,255,255,0.5);">© %d %s · Automated Notification System</p>
+        </td>
+      </tr>
+    </table>
+  </td></tr>
+</table>
+</body>
+</html>`,
+		appName,
+		len(events),
+		len(uniq),
+		rows.String(),
+		appBaseURL,
+		teamName,
+		time.Now().Year(),
+		appName,
+	)
+
+	var lastErr error
+	for _, to := range recipients {
+		to = strings.TrimSpace(to)
+		if to == "" {
+			continue
+		}
+		if err := SendEmail(to, subject, htmlBody); err != nil {
+			lastErr = err
+		}
+	}
+	return lastErr
 }

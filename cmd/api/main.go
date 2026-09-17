@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"log"
 	"time"
+	"context"
 
 	"github.com/AlmightyOggy/management-system/internal/config"
 	"github.com/AlmightyOggy/management-system/internal/handler"
@@ -13,7 +14,7 @@ import (
 	"github.com/AlmightyOggy/management-system/internal/service"
 	// "github.com/AlmightyOggy/management-system/internal/utils"
 
-	// "github.com/AlmightyOggy/management-system/internal/database"
+	"github.com/AlmightyOggy/management-system/internal/database"
 
 	"github.com/gin-gonic/gin"
 )
@@ -36,7 +37,7 @@ func main() {
 	// 	log.Println("Email berhasil dikirim")
 	// }
 
-	// database.AutoMigrate()
+	database.AutoMigrate()
 
 	// database.SeedMasterData(config.DB)
 
@@ -58,6 +59,11 @@ func main() {
 	reportHandler := handler.NewReportHandler(reportService)
 	externalTeamHandler := handler.NewReportExternalTeamHandler(externalTeamService)
 
+	vssRepo := repository.NewVSSDelayRepository(cfg.VSS.LogDir)
+	vssHistoryRepo := repository.NewVSSAlertHistoryRepository(config.DB)
+	vssService := service.NewVSSMonitorService(vssRepo, vssHistoryRepo, cfg.VSS)
+	vssHandler := handler.NewVSSHandler(vssService)
+
 	r := gin.New()
 	r.RedirectTrailingSlash = false
 	r.RedirectFixedPath = false
@@ -68,7 +74,11 @@ func main() {
 	r.Use(middleware.Logger())
 	r.Use(middleware.Recovery())
 
-	routes.SetupRoutes(r, reportHandler, userHandler, externalTeamHandler, masterHandler, commentHandler)
+	routes.SetupRoutes(r, reportHandler, userHandler, externalTeamHandler, masterHandler, commentHandler, vssHandler)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	vssService.Start(ctx)
 
 	port := fmt.Sprintf(":%d", cfg.App.Port)
 	log.Printf("%s started on http://localhost%s", cfg.App.Name, port)

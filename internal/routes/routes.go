@@ -7,7 +7,7 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-func SetupRoutes(r *gin.Engine, reportHandler *handler.ReportHandler, userHandler *handler.UserHandler, externalTeamHandler *handler.ReportExternalTeamHandler, masterHandler *handler.MasterHandler, commentHandler *handler.CommentHandler) {
+func SetupRoutes(r *gin.Engine, reportHandler *handler.ReportHandler, userHandler *handler.UserHandler, externalTeamHandler *handler.ReportExternalTeamHandler, masterHandler *handler.MasterHandler, commentHandler *handler.CommentHandler, vssHandler *handler.VSSHandler) {
 	api := r.Group("/api")
 
 	r.Static("/storage", "./storage/public")
@@ -67,6 +67,12 @@ func SetupRoutes(r *gin.Engine, reportHandler *handler.ReportHandler, userHandle
 		masters.GET("/", masterHandler.GetAll)
 		masters.GET("/external-teams", masterHandler.GetExternalTeams)
 		masters.GET("/scopes", masterHandler.GetScopes)
+	}
+
+	vss := protected.Group("/vss")
+	{
+		vss.GET("/delays", vssHandler.ListDelays)
+		vss.GET("/history", vssHandler.ListHistory)
 	}
 
 	r.GET("/health", func(c *gin.Context) {
