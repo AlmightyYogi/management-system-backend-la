@@ -14,7 +14,7 @@ import (
 	"github.com/AlmightyOggy/management-system/internal/service"
 	// "github.com/AlmightyOggy/management-system/internal/utils"
 
-	"github.com/AlmightyOggy/management-system/internal/database"
+	// "github.com/AlmightyOggy/management-system/internal/database"
 
 	"github.com/gin-gonic/gin"
 )
@@ -37,7 +37,7 @@ func main() {
 	// 	log.Println("Email berhasil dikirim")
 	// }
 
-	database.AutoMigrate()
+	// database.AutoMigrate()
 
 	// database.SeedMasterData(config.DB)
 

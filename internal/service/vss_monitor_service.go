@@ -178,7 +178,8 @@ func (s *vssMonitorService) Start(ctx context.Context) {
 }
 
 func (s *vssMonitorService) loop(ctx context.Context) {
-	backoff := time.Second
+	delay := 15 * time.Second
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -189,19 +190,34 @@ func (s *vssMonitorService) loop(ctx context.Context) {
 
 		err := s.connectAndListen(ctx)
 		if err != nil {
-			log.Printf("[VSS] connection error: %v - retry in %s", err, backoff)
+			log.Printf("[VSS] connection error: %v - retry in %s", err, delay)
 			if s.reasonAllowedForLog("disconnect") {
 				_ = s.saveSystemEvent("disconnect", fmt.Sprintf("WS error: %v", err))
 			}
+
+			if strings.Contains(err.Error(), "too frequently") {
+				delay = 3 * time.Minute
+			} else {
+				delay *= 2
+				if delay > 2*time.Minute {
+					delay = 2 * time.Minute
+				}
+				if delay < 15*time.Second {
+					delay = 15 * time.Second
+				}
+			}
+		} else {
+			delay = 15 * time.Second
+		}
+
+		if ctx.Err() != nil {
+			return
 		}
 
 		select {
 		case <-ctx.Done():
 			return
-		case <-time.After(backoff):
-		}
-		if backoff < 30*time.Second {
-			backoff *= 2
+		case <-time.After(delay):
 		}
 	}
 }
@@ -263,7 +279,10 @@ func (s *vssMonitorService) connectAndListen(ctx context.Context) error {
 		return fmt.Errorf("login: %w", err)
 	}
 
-	dialer := websocket.Dialer{HandshakeTimeout: 15 * time.Second}
+	dialer := websocket.Dialer{
+		Proxy:            http.ProxyFromEnvironment,
+		HandshakeTimeout: 30 * time.Second,
+	}
 	conn, _, err := dialer.DialContext(ctx, s.cfg.WSURL, nil)
 	if err != nil {
 		return fmt.Errorf("ws dial: %w", err)
@@ -274,8 +293,8 @@ func (s *vssMonitorService) connectAndListen(ctx context.Context) error {
 		"action": "80000",
 		"payload": map[string]string{
 			"username": s.cfg.Username,
-			"pid":		pid,
-			"token":	token,
+			"pid":      pid,
+			"token":    token,
 		},
 	}
 	if err := conn.WriteJSON(loginMsg); err != nil {
@@ -283,8 +302,6 @@ func (s *vssMonitorService) connectAndListen(ctx context.Context) error {
 	}
 
 	log.Println("[VSS] websocket connected & logged in")
-	backoffReset := true
-	_ = backoffReset
 
 	for {
 		select {
@@ -491,7 +508,7 @@ func (s *vssMonitorService) handleStatus80003(raw json.RawMessage) {
 	}
 	if s.reasonAllowedForLog("high_cpu") {
 		var cpu float64
-		fmt.Scanf(p.DevTemp.CPU, "%f", &cpu)
+		fmt.Sscanf(p.DevTemp.CPU, "%f", &cpu)
 		if cpu >= 95 {
 			candidates = append(candidates, "high_cpu")
 		}
