@@ -33,6 +33,7 @@ type vssMonitorService struct {
 	cfg			 	config.VSSConfig
 	mu			 	sync.Mutex
 	lastSeen	 	map[string]time.Time
+	deviceName		map[string]string
 	logReasons   	map[string]bool
 	emailReasons 	map[string]bool
 	emailMu      	sync.Mutex
@@ -109,6 +110,7 @@ func NewVSSMonitorService(repo repository.VSSDelayRepository, historyRepo reposi
 		cfg: 			cfg,
 		historyRepo: 	historyRepo,
 		lastSeen: 		make(map[string]time.Time),
+		deviceName: 	make(map[string]string),
 		logReasons: 	parseReasonSet(cfg.LogReasons),
 	}
 
@@ -469,8 +471,16 @@ func (s *vssMonitorService) staleChecker(ctx context.Context) {
 				if !s.reasonAllowedForLog("no_heartbeat") {
 					continue
 				}
+
+				name := deviceID
+				s.mu.Lock()
+				if n, ok := s.deviceName[deviceID]; ok && n != "" {
+					name = n
+				}
+				s.mu.Unlock()
+
 				fake := statusPayload{DeviceID: deviceID}
-				fake.Ext.DeviceName = deviceID
+				fake.Ext.DeviceName = name
 				s.persistIfNotSpam(fake, "no_heartbeat", int64(gap.Seconds()), false, now, "stale", "", "", "")
 			}
 		}
@@ -486,6 +496,9 @@ func (s *vssMonitorService) handleStatus80003(raw json.RawMessage) {
 	now := time.Now()
 	s.mu.Lock()
 	s.lastSeen[p.DeviceID] = now
+	if p.Ext.DeviceName != "" {
+		s.deviceName[p.DeviceID] = p.Ext.DeviceName
+	}
 	s.mu.Unlock()
 
 	isLater := p.IsLater == "1" || p.Ext.IsLater
@@ -534,6 +547,9 @@ func (s *vssMonitorService) handleAlarm80004(raw json.RawMessage) {
 	now := time.Now()
 	s.mu.Lock()
 	s.lastSeen[p.DeviceID] = now
+	if p.DeviceName != "" {
+		s.deviceName[p.DeviceID] = p.DeviceName
+	}
 	s.mu.Unlock()
 
 	sp := statusPayload{
