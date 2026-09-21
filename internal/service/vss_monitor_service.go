@@ -34,6 +34,8 @@ type vssMonitorService struct {
 	mu			 	sync.Mutex
 	lastSeen	 	map[string]time.Time
 	deviceName		map[string]string
+	lastDTU			map[string]string
+	lastReportMs	map[string]int64
 	logReasons   	map[string]bool
 	emailReasons 	map[string]bool
 	emailMu      	sync.Mutex
@@ -111,6 +113,8 @@ func NewVSSMonitorService(repo repository.VSSDelayRepository, historyRepo reposi
 		historyRepo: 	historyRepo,
 		lastSeen: 		make(map[string]time.Time),
 		deviceName: 	make(map[string]string),
+		lastDTU:      	make(map[string]string),
+		lastReportMs: 	make(map[string]int64),
 		logReasons: 	parseReasonSet(cfg.LogReasons),
 	}
 
@@ -473,15 +477,39 @@ func (s *vssMonitorService) staleChecker(ctx context.Context) {
 				}
 
 				name := deviceID
+				dtu := ""
+				var reportMs int64
+
 				s.mu.Lock()
 				if n, ok := s.deviceName[deviceID]; ok && n != "" {
 					name = n
 				}
+				if v, ok := s.lastDTU[deviceID]; ok {
+					dtu = v
+				}
+				if v, ok := s.lastReportMs[deviceID]; ok {
+					reportMs = v
+				}
 				s.mu.Unlock()
 
-				fake := statusPayload{DeviceID: deviceID}
+				fake := statusPayload{
+					DeviceID: deviceID,
+					DTU:      dtu,
+				}
 				fake.Ext.DeviceName = name
-				s.persistIfNotSpam(fake, "no_heartbeat", int64(gap.Seconds()), false, now, "stale", "", "", "")
+				fake.Ext.ReportTime = reportMs
+
+				s.persistIfNotSpam(
+					fake,
+					"no_heartbeat",
+					int64(gap.Seconds()),
+					false,
+					now,
+					"stale",
+					"",
+					"",
+					"",
+				)
 			}
 		}
 	}
@@ -498,6 +526,12 @@ func (s *vssMonitorService) handleStatus80003(raw json.RawMessage) {
 	s.lastSeen[p.DeviceID] = now
 	if p.Ext.DeviceName != "" {
 		s.deviceName[p.DeviceID] = p.Ext.DeviceName
+	}
+	if p.DTU != "" {
+		s.lastDTU[p.DeviceID] = p.DTU
+	}
+	if p.Ext.ReportTime > 0 {
+		s.lastReportMs[p.DeviceID] = p.Ext.ReportTime
 	}
 	s.mu.Unlock()
 
@@ -549,6 +583,11 @@ func (s *vssMonitorService) handleAlarm80004(raw json.RawMessage) {
 	s.lastSeen[p.DeviceID] = now
 	if p.DeviceName != "" {
 		s.deviceName[p.DeviceID] = p.DeviceName
+	}
+	if p.DTU != "" {
+	s.lastDTU[p.DeviceID] = p.DTU
+	} else if p.Payload.DTU != "" {
+		s.lastDTU[p.DeviceID] = p.Payload.DTU
 	}
 	s.mu.Unlock()
 

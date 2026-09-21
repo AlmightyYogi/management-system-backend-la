@@ -11,17 +11,17 @@ func AutoMigrate() {
 	db := config.DB
 
 	err := db.AutoMigrate(
-		// &domain.User{},
-		// &domain.Report{},
-		// &domain.MstSeverity{},
-		// &domain.MstPriority{},
-		// &domain.MstAssignedTo{},
-		// &domain.MstScope{},
-		// &domain.MstImpact{},
-		// &domain.MstApp{},
-		// &domain.MstExternalTeam{},
-		// &domain.MstRole{},
-		// &domain.ReportExternalTeam{},
+		&domain.User{},
+		&domain.Report{},
+		&domain.MstSeverity{},
+		&domain.MstPriority{},
+		&domain.MstAssignedTo{},
+		&domain.MstScope{},
+		&domain.MstImpact{},
+		&domain.MstApp{},
+		&domain.MstExternalTeam{},
+		&domain.MstRole{},
+		&domain.ReportExternalTeam{},
 		&domain.VSSAlertHistory{},
 	)
 
