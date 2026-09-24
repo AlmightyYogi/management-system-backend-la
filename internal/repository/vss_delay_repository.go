@@ -26,16 +26,124 @@ type VSSDelayRepository interface {
 	Append(event domain.VSSDelayEvent) error
 	List(filter VSSDelayFilter) (*domain.VSSDelayListResult, error)
 	ExistsRecent(deviceID, reason string, within time.Duration) (bool, error)
+
+	UpsertLive(device domain.VSSLiveDevice)
+	ListLive(filter VSSLiveFilter) domain.VSSLiveResult
+	IncrementCounter(action string)
+}
+
+type VSSLiveFilter struct {
+	DeviceName string
+	Action     string
+	Status     string
+	OnlyIssue  bool
+	Page       int
+	PerPage    int
 }
 
 type vssDelayRepository struct {
 	dir	string
 	mu 	sync.Mutex
+	liveMu    sync.RWMutex
+	liveState map[string]domain.VSSLiveDevice
+	counterMu   sync.Mutex
+	totalWS     int
+	count80003  int
+	count80004  int
 }
 
 func NewVSSDelayRepository(logDir string) VSSDelayRepository {
 	_ = os.MkdirAll(logDir, 0o755)
 	return &vssDelayRepository{dir: logDir}
+}
+
+func (r *vssDelayRepository) UpsertLive(device domain.VSSLiveDevice) {
+	r.liveMu.Lock()
+	defer r.liveMu.Unlock()
+	r.liveState[device.DeviceID] = device
+}
+
+func (r *vssDelayRepository) ListLive(filter VSSLiveFilter) domain.VSSLiveResult {
+	r.liveMu.RLock()
+	all := make([]domain.VSSLiveDevice, 0, len(r.liveState))
+	for _, d := range r.liveState {
+		all = append(all, d)
+	}
+	r.liveMu.RUnlock()
+
+	filtered := all[:0]
+	for _, d := range all {
+		if filter.DeviceName != "" && !strings.Contains(strings.ToLower(d.DeviceName), strings.ToLower(filter.DeviceName)) {
+			continue
+		}
+		if filter.Action != "" && d.Action != filter.Action {
+			continue
+		}
+		if filter.Status != "" && d.Status != filter.Status {
+			continue
+		}
+		if filter.OnlyIssue && d.Status == "NORMAL" {
+			continue
+		}
+		filtered = append(filtered, d)
+	}
+
+	sort.Slice(filtered, func(i, j int) bool {
+		return filtered[i].DelayMs > filtered[j].DelayMs
+	})
+
+	normal, issue := 0, 0
+	for _, d := range all {
+		if d.Status == "NORMAL" {
+			normal++
+		} else {
+			issue++
+		}
+	}
+
+	r.counterMu.Lock()
+	totalWS, c80003, c80004 := r.totalWS, r.count80003, r.count80004
+	r.counterMu.Unlock()
+
+	total := len(filtered)
+	if filter.Page < 1 {
+		filter.Page = 1
+	}
+	if filter.PerPage < 1 {
+		filter.PerPage = 50
+	}
+	start := (filter.Page - 1) * filter.PerPage
+	if start > total {
+		start = total
+	}
+	end := start + filter.PerPage
+	if end > total {
+		end = total
+	}
+
+	return domain.VSSLiveResult{
+		Data:       filtered[start:end],
+		Total:      total,
+		Page:       filter.Page,
+		PerPage:    filter.PerPage,
+		TotalWS:    totalWS,
+		Count80003: c80003,
+		Count80004: c80004,
+		Normal:     normal,
+		Issue:      issue,
+	}
+}
+
+func (r *vssDelayRepository) IncrementCounter(action string) {
+	r.counterMu.Lock()
+	defer r.counterMu.Unlock()
+	r.totalWS++
+	switch action {
+	case "80003":
+		r.count80003++
+	case "80004":
+		r.count80004++
+	}
 }
 
 func (r *vssDelayRepository) filePath(day time.Time) string {

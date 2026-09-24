@@ -3,6 +3,7 @@ package handler
 import (
 	"net/http"
 	"strconv"
+	"strings"
 
 	"github.com/AlmightyOggy/management-system/internal/repository"
 	"github.com/AlmightyOggy/management-system/internal/service"
@@ -65,4 +66,20 @@ func (h *VSSHandler) ListHistory(c *gin.Context) {
 		"page":     page,
 		"per_page": perPage,
 	})
+}
+
+func (h *VSSHandler) ListLive(c *gin.Context) {
+	onlyIssue := c.Query("only_issue") == "1" || strings.EqualFold(c.Query("only_issue"), "true")
+	page, _    := strconv.Atoi(c.DefaultQuery("page", "1"))
+	perPage, _ := strconv.Atoi(c.DefaultQuery("per_page", "50"))
+
+	res := h.svc.ListLive(
+		c.Query("device_name"),
+		c.Query("action"),
+		c.Query("status"),
+		onlyIssue,
+		page,
+		perPage,
+	)
+	utils.Success(c, "OK", res)
 }

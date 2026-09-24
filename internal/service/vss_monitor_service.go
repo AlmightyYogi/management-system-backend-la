@@ -21,26 +21,64 @@ import (
 	"github.com/gorilla/websocket"
 )
 
+var jakartaTZ, _ = time.LoadLocation("Asia/Jakarta")
+
 type VSSMonitorService interface {
 	Start(ctx context.Context)
 	ListDelays(filter repository.VSSDelayFilter) (*domain.VSSDelayListResult, error)
 	ListHistory(filter repository.VSSHistoryFilter) ([]domain.VSSAlertHistory, int64, error)
+	ListLive(deviceName, action, status string, onlyIssue bool, page, perPage int) *VSSLiveResult
+}
+
+type VSSDeviceLive struct {
+	DeviceID   string `json:"device_id"`
+	DeviceName string `json:"device_name"`
+	NodeID     string `json:"node_id"`
+	DTU        string `json:"dtu"`
+	ReportTime int64  `json:"report_time"`
+	IsLater    bool   `json:"is_later"`
+	DelaySec   int64  `json:"delay_sec"`
+	LastSeen   string `json:"last_seen"`
+	Action     string `json:"action"`
+	Status     string `json:"status"`
+	Reasons    []string `json:"reasons"`
+	CPU        string `json:"cpu,omitempty"`
+	StorageFree string `json:"storage_free,omitempty"`
+}
+
+type VSSTrafficStats struct {
+	TotalMessages int64 `json:"total_messages"`
+	Total80003    int64 `json:"total_80003"`
+	Total80004    int64 `json:"total_80004"`
+	DeviceCount   int   `json:"device_count"`
+	NormalCount   int   `json:"normal_count"`
+	IssueCount    int   `json:"issue_count"`
+}
+
+type VSSLiveResult struct {
+	Traffic VSSTrafficStats  `json:"traffic"`
+	Data    []VSSDeviceLive  `json:"data"`
+	Total   int              `json:"total"`
 }
 
 type vssMonitorService struct {
-	repo		 	repository.VSSDelayRepository
-	historyRepo  	repository.VSSAlertHistoryRepository
-	cfg			 	config.VSSConfig
-	mu			 	sync.Mutex
-	lastSeen	 	map[string]time.Time
-	deviceName		map[string]string
-	lastDTU			map[string]string
-	lastReportMs	map[string]int64
-	logReasons   	map[string]bool
-	emailReasons 	map[string]bool
-	emailMu      	sync.Mutex
-	lastEmail    	map[string]time.Time
-	pendingAlerts 	[]domain.VSSDelayEvent
+	repo         repository.VSSDelayRepository
+	historyRepo  repository.VSSAlertHistoryRepository
+	cfg          config.VSSConfig
+	mu           sync.Mutex
+	lastSeen     map[string]time.Time
+	deviceName   map[string]string
+	lastDTU      map[string]string
+	lastReportMs map[string]int64
+	live         map[string]*VSSDeviceLive
+	trafficTotal int64
+	traffic80003 int64
+	traffic80004 int64
+	logReasons   map[string]bool
+	emailReasons map[string]bool
+	emailMu      sync.Mutex
+	lastEmail    map[string]time.Time
+	pendingAlerts []domain.VSSDelayEvent
 }
 
 type wsEnvelope struct {
@@ -59,6 +97,9 @@ type statusPayload struct {
 		ReportTime int64  `json:"reportTime"`
 		AccessMode int    `json:"accessMode"`
 	} `json:"ext"`
+	Location struct {
+		DTU string `json:"dtu"`
+	} `json:"location"`
 	Storage []struct {
 		Name   string `json:"name"`
 		Free   string `json:"free"`
@@ -116,6 +157,7 @@ func NewVSSMonitorService(repo repository.VSSDelayRepository, historyRepo reposi
 		lastDTU:      	make(map[string]string),
 		lastReportMs: 	make(map[string]int64),
 		logReasons: 	parseReasonSet(cfg.LogReasons),
+		live: 			make(map[string]*VSSDeviceLive),
 	}
 
 	if cfg.EmailCooldownMin <= 0 {
@@ -236,6 +278,98 @@ func (s *vssMonitorService) ListHistory(filter repository.VSSHistoryFilter) ([]d
 	return s.historyRepo.List(filter)
 }
 
+func (s *vssMonitorService) ListLive(
+	deviceName, action, status string,
+	onlyIssue bool,
+	page, perPage int,
+) *VSSLiveResult {
+	if page < 1 {
+		page = 1
+	}
+	if perPage < 1 {
+		perPage = 50
+	}
+	if perPage > 500 {
+		perPage = 500
+	}
+
+	q := strings.ToLower(strings.TrimSpace(deviceName))
+	act := strings.ToLower(strings.TrimSpace(action))
+	st := strings.ToUpper(strings.TrimSpace(status))
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// now := time.Now()
+	all := make([]VSSDeviceLive, 0, len(s.live))
+	normal, issue := 0, 0
+
+	for _, v := range s.live {
+		if v == nil {
+			continue
+		}
+		if len(v.Reasons) == 0 {
+			normal++
+		} else {
+			issue++
+		}
+
+		if onlyIssue && len(v.Reasons) == 0 {
+			continue
+		}
+		if q != "" {
+			name := strings.ToLower(v.DeviceName)
+			id := strings.ToLower(v.DeviceID)
+			if !strings.Contains(name, q) && !strings.Contains(id, q) {
+				continue
+			}
+		}
+		if act != "" && strings.ToLower(v.Action) != act {
+			continue
+		}
+		if st != "" && strings.ToUpper(v.Status) != st {
+			continue
+		}
+
+		cp := *v
+		// cp.DelaySec = s.liveDelayNow(v, now)
+		if len(cp.Reasons) == 0 && cp.DelaySec >= int64(s.cfg.DelayThresholdSec) {
+			cp.Status = "DELAYED"
+		}
+		all = append(all, cp)
+	}
+
+	sort.Slice(all, func(i, j int) bool {
+		if all[i].DelaySec == all[j].DelaySec {
+			return all[i].DeviceName < all[j].DeviceName
+		}
+		return all[i].DelaySec < all[j].DelaySec
+	})
+
+	total := len(all)
+	start := (page - 1) * perPage
+	if start > total {
+		start = total
+	}
+	end := start + perPage
+	if end > total {
+		end = total
+	}
+
+	return &VSSLiveResult{
+		Traffic: VSSTrafficStats{
+			TotalMessages: s.trafficTotal,
+			Total80003:    s.traffic80003,
+			Total80004:    s.traffic80004,
+			DeviceCount:   len(s.live),
+			NormalCount:   normal,
+			IssueCount:    issue,
+		},
+		Data:  all[start:end],
+		Total: total,
+	}
+}
+
 func (s *vssMonitorService) login() (token, pid string, err error) {
 	body := fmt.Sprintf(
 		`{"username": "%s", "password": "%s", "lang": "0", "client": "2"}`,
@@ -325,6 +459,60 @@ func (s *vssMonitorService) connectAndListen(ctx context.Context) error {
 	}
 }
 
+func reportTimeToTime(ms int64) (time.Time, bool) {
+	if ms <= 0 {
+		return time.Time{}, false
+	}
+	if ms < 1_000_000_000_000 {
+		return time.Unix(ms, 0), true
+	}
+	return time.UnixMilli(ms), true
+}
+
+func parseDTU(dtu string) (time.Time, bool) {
+	dtu = strings.TrimSpace(dtu)
+	if dtu == "" {
+		return time.Time{}, false
+	}
+	loc, _ := time.LoadLocation("Asia/Jakarta")
+	if loc == nil {
+		loc = time.FixedZone("WIB", 7*3600)
+	}
+	t, err := time.ParseInLocation("2006-01-02 15:04:05", dtu, loc)
+	if err != nil {
+		return time.Time{}, false
+	}
+	return t, true
+}
+
+func (s *vssMonitorService) deviceEventTime(reportMs int64, dtu string) (time.Time, bool) {
+	if t, ok := parseDTU(dtu); ok {
+		return t, true
+	}
+	if t, ok := reportTimeToTime(reportMs); ok {
+		return t, true
+	}
+	return time.Time{}, false
+}
+
+func (s *vssMonitorService) liveDelayNow(v *VSSDeviceLive, now time.Time) int64 {
+	if t, ok := parseDTU(v.DTU); ok {
+		d := now.Sub(t).Seconds()
+		if d < 0 {
+			return 0
+		}
+		return int64(d)
+	}
+	if t, ok := reportTimeToTime(v.ReportTime); ok {
+		d := now.Sub(t).Seconds()
+		if d < 0 {
+			return 0
+		}
+		return int64(d)
+	}
+	return v.DelaySec
+}
+
 func (s *vssMonitorService) handleMessage(data []byte) {
 	var env wsEnvelope
 	if err := json.Unmarshal(data, &env); err != nil {
@@ -342,27 +530,19 @@ func (s *vssMonitorService) handleMessage(data []byte) {
 }
 
 func (s *vssMonitorService) computeDelaySec(p statusPayload, now time.Time) int64 {
-	if p.Ext.ReportTime > 0 {
-		rt := time.UnixMilli(p.Ext.ReportTime)
-		d := now.Sub(rt).Seconds()
+	if t, ok := parseDTU(p.DTU); ok {
+		d := now.Sub(t).Seconds()
 		if d < 0 {
-			d = -d
+			return 0
 		}
 		return int64(d)
 	}
-	if p.DTU != "" {
-		loc, _ := time.LoadLocation("Asia/Jakarta")
-		if loc == nil {
-			loc = time.FixedZone("WIB", 7*3600)
+	if t, ok := reportTimeToTime(p.Ext.ReportTime); ok {
+		d := now.Sub(t).Seconds()
+		if d < 0 {
+			return 0
 		}
-		t, err := time.ParseInLocation("2006-01-02 15:04:05", p.DTU, loc)
-		if err == nil {
-			d := now.Sub(t).Seconds()
-			if d < 0 {
-				d = -d
-			}
-			return int64(d)
-		}
+		return int64(d)
 	}
 	return 0
 }
@@ -499,6 +679,8 @@ func (s *vssMonitorService) staleChecker(ctx context.Context) {
 				fake.Ext.DeviceName = name
 				fake.Ext.ReportTime = reportMs
 
+				s.upsertLive(fake, "stale", int64(gap.Seconds()), false, []string{"no_heartbeat"}, now)
+
 				s.persistIfNotSpam(
 					fake,
 					"no_heartbeat",
@@ -521,8 +703,26 @@ func (s *vssMonitorService) handleStatus80003(raw json.RawMessage) {
 		return
 	}
 
+	if p.DTU == "" && p.Location.DTU != "" {
+		p.DTU = p.Location.DTU
+	}
+
 	now := time.Now()
+
 	s.mu.Lock()
+	if prev, ok := s.live[p.DeviceID]; ok && prev != nil && p.DTU != "" {
+		newT, okN := parseDTU(p.DTU)
+		oldT, okO := parseDTU(prev.DTU)
+		if okN && okO && newT.Before(oldT) {
+			p.DTU = prev.DTU
+			if prev.ReportTime > 0 {
+				p.Ext.ReportTime = prev.ReportTime
+			}
+		}
+	}
+
+	s.trafficTotal++
+	s.traffic80003++
 	s.lastSeen[p.DeviceID] = now
 	if p.Ext.DeviceName != "" {
 		s.deviceName[p.DeviceID] = p.Ext.DeviceName
@@ -542,15 +742,13 @@ func (s *vssMonitorService) handleStatus80003(raw json.RawMessage) {
 	if isLater {
 		candidates = append(candidates, "delayed")
 	}
-	if delaySec >= s.cfg.DelayThresholdSec {
+	if delaySec >= int64(s.cfg.DelayThresholdSec) {
 		candidates = append(candidates, "stale_timestamp")
 	}
-	if s.reasonAllowedForLog("storage_full") {
-		for _, st := range p.Storage {
-			if st.Free == "0" {
-				candidates = append(candidates, "storage_full")
-				break
-			}
+	for _, st := range p.Storage {
+		if st.Free == "0" {
+			candidates = append(candidates, "storage_full")
+			break
 		}
 	}
 	if s.reasonAllowedForLog("high_cpu") {
@@ -561,13 +759,41 @@ func (s *vssMonitorService) handleStatus80003(raw json.RawMessage) {
 		}
 	}
 
+	if s.traffic80003 == 1 || s.traffic80003%500 == 0 {
+		log.Printf("[VSS] 80003 #%d device=%s dtu=%q delay=%ds reasons=%v",
+			s.traffic80003, p.DeviceID, p.DTU, delaySec, candidates)
+	}
+
 	seen := map[string]bool{}
+	var reasons []string
 	for _, r := range candidates {
 		r = strings.ToLower(r)
-		if seen[r] || !s.reasonAllowedForLog(r) {
+		if seen[r] {
 			continue
 		}
 		seen[r] = true
+		reasons = append(reasons, r)
+	}
+
+	// Debug untuk cek DTU masuk atau tidak
+	if p.Ext.DeviceName == "KWK-1696" || p.DeviceID == "867734081387702" {
+		storage0 := false
+		for _, st := range p.Storage {
+			if st.Free == "0" {
+				storage0 = true
+				break
+			}
+		}
+		log.Printf("[VSS-DEBUG] %s dtu=%q delay=%ds storage0=%v",
+			p.Ext.DeviceName, p.DTU, delaySec, storage0)
+	}
+
+	s.upsertLive(p, "80003", delaySec, isLater, reasons, now)
+
+	for _, r := range reasons {
+		if !s.reasonAllowedForLog(r) {
+			continue
+		}
 		s.persistIfNotSpam(p, r, delaySec, isLater, now, "80003", "", "", "")
 	}
 }
@@ -580,6 +806,8 @@ func (s *vssMonitorService) handleAlarm80004(raw json.RawMessage) {
 
 	now := time.Now()
 	s.mu.Lock()
+	s.trafficTotal++
+	s.traffic80004++
 	s.lastSeen[p.DeviceID] = now
 	if p.DeviceName != "" {
 		s.deviceName[p.DeviceID] = p.DeviceName
@@ -621,17 +849,121 @@ func (s *vssMonitorService) handleAlarm80004(raw json.RawMessage) {
 		reason = "alarm"
 	}
 
-	s.persistIfNotSpam(
-		sp,
-		reason,
-		delaySec,
-		isLater,
-		now,
-		"80004",
-		p.AlarmID,
-		p.AlarmDetail,
-		p.EventType,
-	)
+	s.upsertLive(sp, "80004", delaySec, isLater, []string{reason}, now)
+
+	if s.reasonAllowedForLog(reason) || s.reasonAllowedForLog("alarm") {
+		if !s.reasonAllowedForLog(reason) {
+			reason = "alarm"
+		}
+		s.persistIfNotSpam(sp, reason, delaySec, isLater, now, "80004", p.AlarmID, p.AlarmDetail, p.EventType)
+	}
+}
+
+// func (s *vssMonitorService) ProcessIncoming(action string, payload map[string]interface{}) {
+// 	receivedAt := time.Now()
+// 	s.repo.IncrementCounter(action)
+
+// 	if action != "80003" && action != "80004" {
+// 		return
+// 	}
+
+// 	deviceID, _   := payload["deviceID"].(string)
+// 	nodeID, _     := payload["nodeID"].(string)
+// 	dtuStr, _     := payload["dtu"].(string)
+// 	isLaterStr, _ := payload["isLater"].(string)
+
+// 	ext, _       := payload["ext"].(map[string]interface{})
+// 	deviceName   := ""
+// 	reportTime   := int64(0)
+// 	if ext != nil {
+// 		deviceName, _ = ext["deviceName"].(string)
+// 		if rt, ok := ext["reportTime"].(float64); ok {
+// 			reportTime = int64(rt)
+// 		}
+// 	}
+
+// 	var dtuTime time.Time
+// 	if dtuStr != "" {
+// 		parsed, err := time.ParseInLocation("2006-01-02 15:04:05", dtuStr, jakartaTZ)
+// 		if err == nil {
+// 			dtuTime = parsed
+// 		}
+// 	}
+// 	if dtuTime.IsZero() {
+// 		dtuTime = receivedAt
+// 	}
+
+// 	delayMs := receivedAt.UnixMilli() - dtuTime.UnixMilli()
+// 	if delayMs < 0 {
+// 		delayMs = 0
+// 	}
+// 	delaySec := delayMs / 1000
+
+// 	isLater := isLaterStr == "1"
+
+// 	status := "NORMAL"
+// 	reason := ""
+// 	if storageArr, ok := payload["storage"].([]interface{}); ok {
+// 		for _, si := range storageArr {
+// 			if sm, ok := si.(map[string]interface{}); ok {
+// 				free, _ := sm["free"].(string)
+// 				if free == "0" {
+// 					status = "STORAGE_FULL"
+// 					reason = "STORAGE_FULL"
+// 					break
+// 				}
+// 			}
+// 		}
+// 	}
+
+// 	message := formatDelay(delaySec)
+
+// 	s.repo.UpsertLive(domain.VSSLiveDevice{
+// 		DeviceID:   deviceID,
+// 		DeviceName: deviceName,
+// 		NodeID:     nodeID,
+// 		DTU:        dtuStr,
+// 		LastSeen:   receivedAt.Format("02/01/2006 15:04:05"),
+// 		DelayMs:    delayMs,
+// 		DelaySec:   delaySec,
+// 		Action:     action,
+// 		Reason:     reason,
+// 		Status:     status,
+// 		IsLater:    isLater,
+// 		ReportTime: reportTime,
+// 	})
+
+// 	if status != "NORMAL" || delaySec > 60 {
+// 		event := domain.VSSDelayEvent{
+// 			DetectedAt: receivedAt.Format(time.RFC3339),
+// 			DeviceID:   deviceID,
+// 			DeviceName: deviceName,
+// 			NodeID:     nodeID,
+// 			DTU:        dtuStr,
+// 			ReportTime: reportTime,
+// 			IsLater:    isLater,
+// 			DelayMs:    delayMs,
+// 			DelaySec:   delaySec,
+// 			Reason:     reason,
+// 			Message:    message,
+// 			Action:     action,
+// 		}
+// 		_ = s.repo.Append(event)
+// 	}
+// }
+
+func formatDelay(sec int64) string {
+	if sec < 60 {
+		return fmt.Sprintf("%ds", sec)
+	}
+	m := sec / 60
+	s := sec % 60
+	if m < 60 {
+		return fmt.Sprintf("%dm %ds", m, s)
+	}
+	h := m / 60
+	m = m % 60
+	return fmt.Sprintf("%dh %dm", h, m)
 }
 
 func (s *vssMonitorService) saveHistory(ev domain.VSSDelayEvent) {
@@ -765,6 +1097,77 @@ func (s *vssMonitorService) enqueueAlert(ev domain.VSSDelayEvent) {
 	s.lastEmail[key] = time.Now()
 
 	s.pendingAlerts = append(s.pendingAlerts, ev)
+}
+
+func (s *vssMonitorService) upsertLive(
+	p statusPayload,
+	action string,
+	delaySec int64,
+	isLater bool,
+	reasons []string,
+	now time.Time,
+) {
+	loc, _ := time.LoadLocation("Asia/Jakarta")
+	if loc == nil {
+		loc = time.FixedZone("WIB", 7*3600)
+	}
+
+	status := "NORMAL"
+	if len(reasons) > 0 {
+		switch {
+		case containsStr(reasons, "alarm"):
+			status = "ALARM"
+		case containsStr(reasons, "no_heartbeat"):
+			status = "STALE"
+		case containsStr(reasons, "storage_full"):
+			status = "STORAGE_FULL"
+		case containsStr(reasons, "high_cpu"):
+			status = "HIGH_CPU"
+		case containsStr(reasons, "delayed"), containsStr(reasons, "stale_timestamp"):
+			status = "DELAYED"
+		default:
+			status = "ISSUE"
+		}
+	}
+
+	name := p.Ext.DeviceName
+	if name == "" {
+		name = p.DeviceID
+	}
+
+	var storageFree, cpu string
+	if len(p.Storage) > 0 {
+		storageFree = p.Storage[0].Free
+	}
+	cpu = p.DevTemp.CPU
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.live[p.DeviceID] = &VSSDeviceLive{
+		DeviceID:    p.DeviceID,
+		DeviceName:  name,
+		NodeID:      p.NodeID,
+		DTU:         p.DTU,
+		ReportTime:  p.Ext.ReportTime,
+		IsLater:     isLater,
+		DelaySec:    delaySec,
+		LastSeen:    now.In(loc).Format(time.RFC3339),
+		Action:      action,
+		Status:      status,
+		Reasons:     append([]string{}, reasons...),
+		CPU:         cpu,
+		StorageFree: storageFree,
+	}
+}
+
+func containsStr(ss []string, v string) bool {
+	for _, x := range ss {
+		if x == v {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *vssMonitorService) emailDigestLoop(ctx context.Context) {
