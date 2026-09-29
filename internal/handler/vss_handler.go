@@ -83,3 +83,8 @@ func (h *VSSHandler) ListLive(c *gin.Context) {
 	)
 	utils.Success(c, "OK", res)
 }
+
+func (h *VSSHandler) GetTraffic(c *gin.Context) {
+	res := h.svc.GetTraffic()
+	utils.Success(c, "OK", res)
+}

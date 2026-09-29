@@ -28,6 +28,7 @@ type VSSMonitorService interface {
 	ListDelays(filter repository.VSSDelayFilter) (*domain.VSSDelayListResult, error)
 	ListHistory(filter repository.VSSHistoryFilter) ([]domain.VSSAlertHistory, int64, error)
 	ListLive(deviceName, action, status string, onlyIssue bool, page, perPage int) *VSSLiveResult
+	GetTraffic() *VSSTrafficDetail
 }
 
 type VSSDeviceLive struct {
@@ -55,6 +56,20 @@ type VSSTrafficStats struct {
 	IssueCount    int   `json:"issue_count"`
 }
 
+type MinuteTraffic struct {
+	Minute string           `json:"minute"`
+	Counts map[string]int64 `json:"counts"`
+	Total  int64            `json:"total"`
+}
+
+type VSSTrafficDetail struct {
+	Totals         map[string]int64 `json:"totals"`
+	TotalMessages  int64            `json:"total_messages"`
+	CurrentMinute  MinuteTraffic    `json:"current_minute"`
+	Series         []MinuteTraffic  `json:"series"`
+	TrackedActions []string         `json:"tracked_actions"`
+}
+
 type VSSLiveResult struct {
 	Traffic VSSTrafficStats  `json:"traffic"`
 	Data    []VSSDeviceLive  `json:"data"`
@@ -79,6 +94,10 @@ type vssMonitorService struct {
 	emailMu      sync.Mutex
 	lastEmail    map[string]time.Time
 	pendingAlerts []domain.VSSDelayEvent
+	trafficByAction map[string]int64
+	currentMinute   time.Time
+	currentCounts   map[string]int64
+	minuteHistory   []MinuteTraffic
 }
 
 type wsEnvelope struct {
@@ -139,7 +158,7 @@ func NewVSSMonitorService(repo repository.VSSDelayRepository, historyRepo reposi
 		cfg.DelayThresholdSec = 60
 	}
 	if cfg.StaleThresholdSec <= 0 {
-		cfg.StaleThresholdSec = 90
+		cfg.StaleThresholdSec = 300
 	}
 	if strings.TrimSpace(cfg.LogReasons) == "" {
 		cfg.LogReasons = "delayed,stale_timestamp,no_heartbeat,disconnect"
@@ -158,6 +177,9 @@ func NewVSSMonitorService(repo repository.VSSDelayRepository, historyRepo reposi
 		lastReportMs: 	make(map[string]int64),
 		logReasons: 	parseReasonSet(cfg.LogReasons),
 		live: 			make(map[string]*VSSDeviceLive),
+		trafficByAction: make(map[string]int64),
+		currentCounts:   make(map[string]int64),
+		minuteHistory:   make([]MinuteTraffic, 0, 60),
 	}
 
 	if cfg.EmailCooldownMin <= 0 {
@@ -218,6 +240,12 @@ func (s *vssMonitorService) Start(ctx context.Context) {
 		log.Println("[VSS] monitor disabled (VSS_ENABLED=false)")
 		return
 	}
+	now := time.Now()
+	log.Printf("[VSS] server time local=%s utc=%s jakarta=%s",
+		now.Format(time.RFC3339),
+		now.UTC().Format(time.RFC3339),
+		now.In(jakartaTZ).Format(time.RFC3339),
+	)
 	go s.loop(ctx)
 	go s.staleChecker(ctx)
 	go s.logCleanup(ctx)
@@ -300,7 +328,6 @@ func (s *vssMonitorService) ListLive(
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	// now := time.Now()
 	all := make([]VSSDeviceLive, 0, len(s.live))
 	normal, issue := 0, 0
 
@@ -332,7 +359,6 @@ func (s *vssMonitorService) ListLive(
 		}
 
 		cp := *v
-		// cp.DelaySec = s.liveDelayNow(v, now)
 		if len(cp.Reasons) == 0 && cp.DelaySec >= int64(s.cfg.DelayThresholdSec) {
 			cp.Status = "DELAYED"
 		}
@@ -356,17 +382,49 @@ func (s *vssMonitorService) ListLive(
 		end = total
 	}
 
+	c03 := s.trafficByAction["80003"]
+	c04 := s.trafficByAction["80004"]
 	return &VSSLiveResult{
 		Traffic: VSSTrafficStats{
 			TotalMessages: s.trafficTotal,
-			Total80003:    s.traffic80003,
-			Total80004:    s.traffic80004,
+			Total80003:    c03,
+			Total80004:    c04,
 			DeviceCount:   len(s.live),
 			NormalCount:   normal,
 			IssueCount:    issue,
 		},
 		Data:  all[start:end],
 		Total: total,
+	}
+}
+
+func (s *vssMonitorService) GetTraffic() *VSSTrafficDetail {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	tracked := []string{"80003", "80004", "80005", "80007", "80030"}
+
+	totals := copyInt64Map(s.trafficByAction)
+	series := make([]MinuteTraffic, len(s.minuteHistory))
+	copy(series, s.minuteHistory)
+
+	cur := MinuteTraffic{
+		Minute: "",
+		Counts: map[string]int64{},
+		Total:  0,
+	}
+	if !s.currentMinute.IsZero() {
+		cur.Minute = s.currentMinute.Format("15:04")
+		cur.Counts = copyInt64Map(s.currentCounts)
+		cur.Total = sumInt64Map(s.currentCounts)
+	}
+
+	return &VSSTrafficDetail{
+		Totals:         totals,
+		TotalMessages:  s.trafficTotal,
+		CurrentMinute:  cur,
+		Series:         series,
+		TrackedActions: tracked,
 	}
 }
 
@@ -480,6 +538,7 @@ func parseDTU(dtu string) (time.Time, bool) {
 	}
 	t, err := time.ParseInLocation("2006-01-02 15:04:05", dtu, loc)
 	if err != nil {
+		log.Printf("[VSS-DTU-PARSE-FAIL] raw=%q err=%v", dtu, err)
 		return time.Time{}, false
 	}
 	return t, true
@@ -519,30 +578,189 @@ func (s *vssMonitorService) handleMessage(data []byte) {
 		return
 	}
 
+	s.recordTraffic(env.Action)
+
+	if updated := s.tryUpsertFromAny(env.Action, env.Payload); updated {
+		return
+	}
+
 	switch env.Action {
 	case "80003":
 		s.handleStatus80003(env.Payload)
 	case "80004":
 		s.handleAlarm80004(env.Payload)
-	default:
-		return
 	}
+}
+
+func (s *vssMonitorService) tryUpsertFromAny(action string, raw json.RawMessage) bool {
+	var m map[string]interface{}
+	if err := json.Unmarshal(raw, &m); err != nil {
+		return false
+	}
+
+	deviceID, _ := m["deviceID"].(string)
+	if deviceID == "" {
+		deviceID, _ = m["deviceId"].(string)
+	}
+	if deviceID == "" {
+		return false
+	}
+
+	dtu, _ := m["dtu"].(string)
+	if dtu == "" {
+		if loc, ok := m["location"].(map[string]interface{}); ok {
+			dtu, _ = loc["dtu"].(string)
+		}
+	}
+	if dtu == "" {
+		if pl, ok := m["payload"].(map[string]interface{}); ok {
+			dtu, _ = pl["dtu"].(string)
+		}
+	}
+
+	deviceName := ""
+	var reportMs int64
+	if ext, ok := m["ext"].(map[string]interface{}); ok {
+		deviceName, _ = ext["deviceName"].(string)
+		if rt, ok := ext["reportTime"].(float64); ok {
+			reportMs = int64(rt)
+		}
+	}
+	if deviceName == "" {
+		deviceName, _ = m["deviceName"].(string)
+	}
+
+	if dtu == "" && reportMs <= 0 {
+		return false
+	}
+
+	now := time.Now()
+	p := statusPayload{
+		DeviceID: deviceID,
+		DTU:      dtu,
+	}
+	p.Ext.DeviceName = deviceName
+	p.Ext.ReportTime = reportMs
+	if node, ok := m["nodeID"].(string); ok {
+		p.NodeID = node
+	}
+
+	var reasons []string
+	if arr, ok := m["storage"].([]interface{}); ok {
+		for _, it := range arr {
+			if sm, ok := it.(map[string]interface{}); ok {
+				if free, _ := sm["free"].(string); free == "0" {
+					reasons = append(reasons, "storage_full")
+					break
+				}
+			}
+		}
+	}
+	if action == "80004" {
+		reasons = append(reasons, "alarm")
+	}
+
+	delaySec := s.computeDelaySec(p, now)
+
+	if s.trafficTotal%200 == 0 || delaySec < -5 || delaySec > 60 {
+		log.Printf(
+			"[VSS-SKEW] action=%s device=%s name=%q dtu=%q reportMs=%d now=%s delay=%ds lastSeen=now",
+			action,
+			deviceID,
+			deviceName,
+			dtu,
+			reportMs,
+			now.In(jakartaTZ).Format("2006-01-02 15:04:05.000"),
+			delaySec,
+		)
+	}
+
+	if delaySec >= int64(s.cfg.DelayThresholdSec) {
+		reasons = append(reasons, "stale_timestamp")
+	}
+
+	s.mu.Lock()
+	s.lastSeen[deviceID] = now
+	if deviceName != "" {
+		s.deviceName[deviceID] = deviceName
+	}
+	if dtu != "" {
+		s.lastDTU[deviceID] = dtu
+	}
+	if reportMs > 0 {
+		s.lastReportMs[deviceID] = reportMs
+	}
+	s.mu.Unlock()
+
+	s.upsertLive(p, action, delaySec, false, reasons, now, time.Time{})
+	return true
+}
+
+func copyInt64Map(m map[string]int64) map[string]int64 {
+	out := make(map[string]int64, len(m))
+	for k, v := range m {
+		out[k] = v
+	}
+	return out
+}
+
+func sumInt64Map(m map[string]int64) int64 {
+	var t int64
+	for _, v := range m {
+		t += v
+	}
+	return t
+}
+
+func (s *vssMonitorService) recordTraffic(action string) {
+	action = strings.TrimSpace(action)
+	if action == "" {
+		action = "unknown"
+	}
+
+	now := time.Now()
+	if jakartaTZ != nil {
+		now = now.In(jakartaTZ)
+	}
+	minuteKey := now.Truncate(time.Minute)
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.trafficTotal++
+	if s.trafficByAction == nil {
+		s.trafficByAction = make(map[string]int64)
+	}
+	s.trafficByAction[action]++
+
+	if s.currentMinute.IsZero() {
+		s.currentMinute = minuteKey
+		s.currentCounts = make(map[string]int64)
+	} else if !s.currentMinute.Equal(minuteKey) {
+		s.minuteHistory = append(s.minuteHistory, MinuteTraffic{
+			Minute: s.currentMinute.Format("15:04"),
+			Counts: copyInt64Map(s.currentCounts),
+			Total:  sumInt64Map(s.currentCounts),
+		})
+		if len(s.minuteHistory) > 60 {
+			s.minuteHistory = s.minuteHistory[len(s.minuteHistory)-60:]
+		}
+		s.currentMinute = minuteKey
+		s.currentCounts = make(map[string]int64)
+	}
+
+	if s.currentCounts == nil {
+		s.currentCounts = make(map[string]int64)
+	}
+	s.currentCounts[action]++
 }
 
 func (s *vssMonitorService) computeDelaySec(p statusPayload, now time.Time) int64 {
 	if t, ok := parseDTU(p.DTU); ok {
-		d := now.Sub(t).Seconds()
-		if d < 0 {
-			return 0
-		}
-		return int64(d)
+		return int64(now.Sub(t).Seconds())
 	}
 	if t, ok := reportTimeToTime(p.Ext.ReportTime); ok {
-		d := now.Sub(t).Seconds()
-		if d < 0 {
-			return 0
-		}
-		return int64(d)
+		return int64(now.Sub(t).Seconds())
 	}
 	return 0
 }
@@ -679,7 +897,7 @@ func (s *vssMonitorService) staleChecker(ctx context.Context) {
 				fake.Ext.DeviceName = name
 				fake.Ext.ReportTime = reportMs
 
-				s.upsertLive(fake, "stale", int64(gap.Seconds()), false, []string{"no_heartbeat"}, now)
+				s.upsertLive(fake, "stale", int64(gap.Seconds()), false, []string{"no_heartbeat"}, now, last)
 
 				s.persistIfNotSpam(
 					fake,
@@ -714,15 +932,12 @@ func (s *vssMonitorService) handleStatus80003(raw json.RawMessage) {
 		newT, okN := parseDTU(p.DTU)
 		oldT, okO := parseDTU(prev.DTU)
 		if okN && okO && newT.Before(oldT) {
-			p.DTU = prev.DTU
-			if prev.ReportTime > 0 {
-				p.Ext.ReportTime = prev.ReportTime
-			}
+			// tetap pakai DTU baru dari payload agar "apa adanya"; hapus blok ini jika ingin force monotonic
+			// p.DTU = prev.DTU
+			// if prev.ReportTime > 0 { p.Ext.ReportTime = prev.ReportTime }
 		}
 	}
 
-	s.trafficTotal++
-	s.traffic80003++
 	s.lastSeen[p.DeviceID] = now
 	if p.Ext.DeviceName != "" {
 		s.deviceName[p.DeviceID] = p.Ext.DeviceName
@@ -737,6 +952,19 @@ func (s *vssMonitorService) handleStatus80003(raw json.RawMessage) {
 
 	isLater := p.IsLater == "1" || p.Ext.IsLater
 	delaySec := s.computeDelaySec(p, now)
+
+	if s.traffic80003%200 == 0 || delaySec < -5 || delaySec > 60 {
+		log.Printf(
+			"[VSS-SKEW] 80003 device=%s name=%q dtu=%q reportMs=%d now=%s delay=%ds isLater=%v",
+			p.DeviceID,
+			p.Ext.DeviceName,
+			p.DTU,
+			p.Ext.ReportTime,
+			now.In(jakartaTZ).Format("2006-01-02 15:04:05.000"),
+			delaySec,
+			isLater,
+		)
+	}
 
 	var candidates []string
 	if isLater {
@@ -759,11 +987,6 @@ func (s *vssMonitorService) handleStatus80003(raw json.RawMessage) {
 		}
 	}
 
-	if s.traffic80003 == 1 || s.traffic80003%500 == 0 {
-		log.Printf("[VSS] 80003 #%d device=%s dtu=%q delay=%ds reasons=%v",
-			s.traffic80003, p.DeviceID, p.DTU, delaySec, candidates)
-	}
-
 	seen := map[string]bool{}
 	var reasons []string
 	for _, r := range candidates {
@@ -775,20 +998,7 @@ func (s *vssMonitorService) handleStatus80003(raw json.RawMessage) {
 		reasons = append(reasons, r)
 	}
 
-	// Debug untuk cek DTU masuk atau tidak
-	if p.Ext.DeviceName == "KWK-1696" || p.DeviceID == "867734081387702" {
-		storage0 := false
-		for _, st := range p.Storage {
-			if st.Free == "0" {
-				storage0 = true
-				break
-			}
-		}
-		log.Printf("[VSS-DEBUG] %s dtu=%q delay=%ds storage0=%v",
-			p.Ext.DeviceName, p.DTU, delaySec, storage0)
-	}
-
-	s.upsertLive(p, "80003", delaySec, isLater, reasons, now)
+	s.upsertLive(p, "80003", delaySec, isLater, reasons, now, time.Time{})
 
 	for _, r := range reasons {
 		if !s.reasonAllowedForLog(r) {
@@ -806,23 +1016,21 @@ func (s *vssMonitorService) handleAlarm80004(raw json.RawMessage) {
 
 	now := time.Now()
 	s.mu.Lock()
-	s.trafficTotal++
-	s.traffic80004++
 	s.lastSeen[p.DeviceID] = now
 	if p.DeviceName != "" {
 		s.deviceName[p.DeviceID] = p.DeviceName
 	}
 	if p.DTU != "" {
-	s.lastDTU[p.DeviceID] = p.DTU
+		s.lastDTU[p.DeviceID] = p.DTU
 	} else if p.Payload.DTU != "" {
 		s.lastDTU[p.DeviceID] = p.Payload.DTU
 	}
 	s.mu.Unlock()
 
 	sp := statusPayload{
-		DeviceID: 	p.DeviceID,
-		NodeID: 	p.NodeID,
-		DTU: 		p.DTU,
+		DeviceID: p.DeviceID,
+		NodeID:   p.NodeID,
+		DTU:      p.DTU,
 	}
 	if sp.DTU == "" {
 		sp.DTU = p.Payload.DTU
@@ -838,18 +1046,8 @@ func (s *vssMonitorService) handleAlarm80004(raw json.RawMessage) {
 	isLater := p.IsLater != 0
 
 	reason := "alarm"
-	if et := strings.ToLower(strings.TrimSpace(p.EventType)); et != "" {
-		reason = "alarm"
-	}
 
-	if !s.reasonAllowedForLog(reason) && !s.reasonAllowedForLog("alarm") {
-		return
-	}
-	if !s.reasonAllowedForLog(reason) {
-		reason = "alarm"
-	}
-
-	s.upsertLive(sp, "80004", delaySec, isLater, []string{reason}, now)
+	s.upsertLive(sp, "80004", delaySec, isLater, []string{reason}, now, time.Time{})
 
 	if s.reasonAllowedForLog(reason) || s.reasonAllowedForLog("alarm") {
 		if !s.reasonAllowedForLog(reason) {
@@ -1106,6 +1304,7 @@ func (s *vssMonitorService) upsertLive(
 	isLater bool,
 	reasons []string,
 	now time.Time,
+	lastSeenOverride time.Time,
 ) {
 	loc, _ := time.LoadLocation("Asia/Jakarta")
 	if loc == nil {
@@ -1141,23 +1340,28 @@ func (s *vssMonitorService) upsertLive(
 	}
 	cpu = p.DevTemp.CPU
 
+	seenAt := now
+	if !lastSeenOverride.IsZero() {
+		seenAt = lastSeenOverride
+	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	s.live[p.DeviceID] = &VSSDeviceLive{
-		DeviceID:    p.DeviceID,
-		DeviceName:  name,
-		NodeID:      p.NodeID,
-		DTU:         p.DTU,
-		ReportTime:  p.Ext.ReportTime,
-		IsLater:     isLater,
-		DelaySec:    delaySec,
-		LastSeen:    now.In(loc).Format(time.RFC3339),
-		Action:      action,
-		Status:      status,
-		Reasons:     append([]string{}, reasons...),
-		CPU:         cpu,
-		StorageFree: storageFree,
+		DeviceID:     p.DeviceID,
+		DeviceName:   name,
+		NodeID:       p.NodeID,
+		DTU:          p.DTU,
+		ReportTime:   p.Ext.ReportTime,
+		IsLater:      isLater,
+		DelaySec:     delaySec,
+		LastSeen:     seenAt.In(loc).Format(time.RFC3339),
+		Action:       action,
+		Status:       status,
+		Reasons:      append([]string{}, reasons...),
+		CPU:          cpu,
+		StorageFree:  storageFree,
 	}
 }
 
