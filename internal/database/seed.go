@@ -93,6 +93,7 @@ func SeedMasterData(db *gorm.DB) {
 		{Name: "admin"},
 		{Name: "viewer"},
 		{Name: "user"},
+		{Name: "guest"},
 	}
 	seedMaster(db, "MstRole", roles)
 
