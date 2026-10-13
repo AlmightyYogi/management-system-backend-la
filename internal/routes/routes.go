@@ -17,13 +17,16 @@ func SetupRoutes(r *gin.Engine, reportHandler *handler.ReportHandler, userHandle
 	protected := api.Group("/")
 	protected.Use(middleware.AuthMiddleware())
 
-	auths := protected.Group("/register")
+	nonGuest := protected.Group("/")
+	nonGuest.Use(middleware.DenyRoles(middleware.RoleGuest))
+
+	auths := nonGuest.Group("/register")
 	{
 		auths.POST("", userHandler.Register)
 		auths.POST("/", userHandler.Register)
 	}
 
-	accounts := protected.Group("/accounts")
+	accounts := nonGuest.Group("/accounts")
 	{
 		accounts.GET("", userHandler.GetAllUsers)
 		accounts.GET("/", userHandler.GetAllUsers)
@@ -31,7 +34,7 @@ func SetupRoutes(r *gin.Engine, reportHandler *handler.ReportHandler, userHandle
 		accounts.PUT("/:uuid", userHandler.UpdateUser)
 	}
 
-	reports := protected.Group("/reports")
+	reports := nonGuest.Group("/reports")
 	{
 		reports.POST("", reportHandler.CreateReport)
 		reports.POST("/", reportHandler.CreateReport)
@@ -51,7 +54,7 @@ func SetupRoutes(r *gin.Engine, reportHandler *handler.ReportHandler, userHandle
 		reports.DELETE("/:uuid/comments/:commentId", commentHandler.DeleteComment)
 	}
 
-	externalTeams := protected.Group("/report-external-teams")
+	externalTeams := nonGuest.Group("/report-external-teams")
 	{
 		externalTeams.GET("", externalTeamHandler.GetByReportID)
 		externalTeams.GET("/", externalTeamHandler.GetByReportID)
@@ -61,7 +64,7 @@ func SetupRoutes(r *gin.Engine, reportHandler *handler.ReportHandler, userHandle
 		externalTeams.DELETE("/:id", externalTeamHandler.DeleteExternalTeam)
 	}
 
-	masters := protected.Group("/master")
+	masters := nonGuest.Group("/master")
 	{
 		masters.GET("", masterHandler.GetAll)
 		masters.GET("/", masterHandler.GetAll)

@@ -820,8 +820,11 @@ func (s *vssMonitorService) persistIfNotSpam(
 		return
 	}
 
-	if s.reasonAllowedForEmail(reason) {
+	if s.reasonAllowedForLog(reason) {
 		s.saveHistory(ev)
+	}
+
+	if s.reasonAllowedForEmail(reason) {
 		s.enqueueAlert(ev)
 	}
 }
@@ -877,6 +880,7 @@ func (s *vssMonitorService) staleChecker(ctx context.Context) {
 				name := deviceID
 				dtu := ""
 				var reportMs int64
+				var delaySec int64
 
 				s.mu.Lock()
 				if n, ok := s.deviceName[deviceID]; ok && n != "" {
@@ -888,6 +892,15 @@ func (s *vssMonitorService) staleChecker(ctx context.Context) {
 				if v, ok := s.lastReportMs[deviceID]; ok {
 					reportMs = v
 				}
+				if prev, ok := s.live[deviceID]; ok && prev != nil {
+					delaySec = prev.DelaySec
+				} else if t, ok := parseDTU(dtu); ok {
+					d := now.Sub(t).Seconds()
+					if d < 0 {
+						d = 0
+					}
+					delaySec = int64(d)
+				}
 				s.mu.Unlock()
 
 				fake := statusPayload{
@@ -897,12 +910,12 @@ func (s *vssMonitorService) staleChecker(ctx context.Context) {
 				fake.Ext.DeviceName = name
 				fake.Ext.ReportTime = reportMs
 
-				s.upsertLive(fake, "stale", int64(gap.Seconds()), false, []string{"no_heartbeat"}, now, last)
+				s.upsertLive(fake, "stale", delaySec, false, []string{"no_heartbeat"}, now, last)
 
 				s.persistIfNotSpam(
 					fake,
 					"no_heartbeat",
-					int64(gap.Seconds()),
+					delaySec,
 					false,
 					now,
 					"stale",

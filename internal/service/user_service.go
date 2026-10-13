@@ -106,7 +106,7 @@ func (s *userService) GetAllUsers() ([]dto.UserRequest, error) {
 			Phone:       u.Phone,
 			Image:       u.Image,
 			RoleID:      u.RoleID,
-			RoleName:    roleNameFromID(u.RoleID),
+			RoleName:    utils.RoleNameFromID(u.RoleID),
 			Active:      u.Active,
 			LastLoginAt: lastLoginStr,
 		})
@@ -156,17 +156,4 @@ func (s *userService) UpdateUser(uuid string, req dto.UpdateUserRequest) (*domai
 		return nil, err
 	}
 	return user, nil
-}
-
-func roleNameFromID(id uint) string {
-	switch id {
-	case 1:
-		return "Administrator"
-	case 2:
-		return "IT Agent"
-	case 3:
-		return "End User"
-	default:
-		return "End User"
-	}
 }

@@ -88,6 +88,7 @@ func (h *UserHandler) Login(c *gin.Context) {
 			"phone":         user.Phone,
 			"image":         user.Image,
 			"role_id":       user.RoleID,
+			"role_name":     utils.RoleNameFromID(user.RoleID),
 			"active":        user.Active,
 			"last_login_at": user.LastLoginAt,
 		},
