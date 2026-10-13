@@ -27,7 +27,7 @@ type VSSMonitorService interface {
 	Start(ctx context.Context)
 	ListDelays(filter repository.VSSDelayFilter) (*domain.VSSDelayListResult, error)
 	ListHistory(filter repository.VSSHistoryFilter) ([]domain.VSSAlertHistory, int64, error)
-	ListLive(deviceName, action, status string, onlyIssue bool, page, perPage int) *VSSLiveResult
+	ListLive(deviceName, action, status string, onlyIssue bool, page, perPage int, sortBy, sortDir string) *VSSLiveResult
 	GetTraffic() *VSSTrafficDetail
 }
 
@@ -306,11 +306,7 @@ func (s *vssMonitorService) ListHistory(filter repository.VSSHistoryFilter) ([]d
 	return s.historyRepo.List(filter)
 }
 
-func (s *vssMonitorService) ListLive(
-	deviceName, action, status string,
-	onlyIssue bool,
-	page, perPage int,
-) *VSSLiveResult {
+func (s *vssMonitorService) ListLive(deviceName, action, status string, onlyIssue bool, page, perPage int, sortBy, sortDir string) *VSSLiveResult {
 	if page < 1 {
 		page = 1
 	}
@@ -365,11 +361,39 @@ func (s *vssMonitorService) ListLive(
 		all = append(all, cp)
 	}
 
+	asc := strings.EqualFold(strings.TrimSpace(sortDir), "asc")
+	key := strings.ToLower(strings.TrimSpace(sortBy))
+
 	sort.Slice(all, func(i, j int) bool {
-		if all[i].DelaySec == all[j].DelaySec {
-			return all[i].DeviceName < all[j].DeviceName
+		var less bool
+		switch key {
+		case "device_name", "name":
+			less = strings.ToLower(all[i].DeviceName) < strings.ToLower(all[j].DeviceName)
+		case "device_id":
+			less = all[i].DeviceID < all[j].DeviceID
+		case "last_seen", "last_report":
+			less = all[i].LastSeen < all[j].LastSeen
+		case "dtu", "device_time":
+			less = all[i].DTU < all[j].DTU
+		case "report_time", "sent_to_middleware":
+			less = all[i].ReportTime < all[j].ReportTime
+		case "action":
+			less = all[i].Action < all[j].Action
+		case "status":
+			less = all[i].Status < all[j].Status
+		case "delay_sec", "delay":
+			fallthrough
+		default:
+			if all[i].DelaySec == all[j].DelaySec {
+				less = all[i].DeviceName < all[j].DeviceName
+			} else {
+				less = all[i].DelaySec < all[j].DelaySec
+			}
 		}
-		return all[i].DelaySec < all[j].DelaySec
+		if asc {
+			return less
+		}
+		return !less
 	})
 
 	total := len(all)

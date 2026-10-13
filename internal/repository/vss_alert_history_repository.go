@@ -1,6 +1,7 @@
 package repository
 
 import (
+	"strings"
 	"time"
 
 	"github.com/AlmightyOggy/management-system/internal/domain"
@@ -16,6 +17,8 @@ type VSSHistoryFilter struct {
 	EndDate    string
 	Page       int
 	PerPage    int
+	SortBy     string
+	SortDir    string
 }
 
 type VSSAlertHistoryRepository interface {
@@ -81,12 +84,41 @@ func (r *vssAlertHistoryRepository) List(filter VSSHistoryFilter) ([]domain.VSSA
 	}
 	offset := (filter.Page - 1) * filter.PerPage
 
+	orderCol := mapHistorySort(filter.SortBy)
+	orderDir := "DESC"
+	if strings.EqualFold(filter.SortDir, "asc") {
+		orderDir = "ASC"
+	}
+
 	var rows []domain.VSSAlertHistory
-	err := q.Order("detected_at DESC").
+	err := q.Order(orderCol + " " + orderDir).
 		Offset(offset).
 		Limit(filter.PerPage).
 		Find(&rows).Error
 	return rows, total, err
+}
+
+func mapHistorySort(sortBy string) string {
+	switch strings.ToLower(strings.TrimSpace(sortBy)) {
+	case "device_name", "name":
+		return "device_name"
+	case "device_id":
+		return "device_id"
+	case "delay_sec", "delay":
+		return "delay_sec"
+	case "dtu", "device_time":
+		return "dtu"
+	case "reason":
+		return "reason"
+	case "action":
+		return "action"
+	case "report_time", "sent_to_middleware":
+		return "report_time"
+	case "detected_at", "last_seen", "last_report":
+		return "detected_at"
+	default:
+		return "detected_at"
+	}
 }
 
 func (r *vssAlertHistoryRepository) CountByMonth(yearMonth string) (int64, error) {

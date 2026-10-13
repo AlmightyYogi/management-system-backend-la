@@ -53,6 +53,8 @@ func (h *VSSHandler) ListHistory(c *gin.Context) {
 		EndDate:    c.Query("end_date"),
 		Page:       page,
 		PerPage:    perPage,
+		SortBy:     c.DefaultQuery("sort_by", "detected_at"),
+		SortDir:    c.DefaultQuery("sort_dir", "desc"),
 	}
 
 	rows, total, err := h.svc.ListHistory(filter)
@@ -80,6 +82,8 @@ func (h *VSSHandler) ListLive(c *gin.Context) {
 		onlyIssue,
 		page,
 		perPage,
+		c.DefaultQuery("sort_by", "delay_sec"),
+		c.DefaultQuery("sort_dir", "asc"),
 	)
 	utils.Success(c, "OK", res)
 }
