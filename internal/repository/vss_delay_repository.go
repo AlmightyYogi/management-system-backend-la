@@ -3,6 +3,7 @@ package repository
 import (
 	"bufio"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
@@ -30,6 +31,8 @@ type VSSDelayRepository interface {
 	UpsertLive(device domain.VSSLiveDevice)
 	ListLive(filter VSSLiveFilter) domain.VSSLiveResult
 	IncrementCounter(action string)
+
+	ListAllByDate(date string) ([]domain.VSSDelayEvent, error)
 }
 
 type VSSLiveFilter struct {
@@ -279,4 +282,49 @@ func (r *vssDelayRepository) ExistsRecent(deviceID, reason string, within time.D
 		}
 	}
 	return false, sc.Err()
+}
+
+func (r *vssDelayRepository) ListAllByDate(date string) ([]domain.VSSDelayEvent, error) {
+	day := time.Now()
+	if date != "" {
+		if t, err := time.Parse("2006-01-02", date); err == nil {
+			day = t
+		} else {
+			return nil, fmt.Errorf("invalid date %q: %w", date, err)
+		}
+	}
+
+	path := r.filePath(day)
+	f, err := os.Open(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return []domain.VSSDelayEvent{}, nil
+		}
+		return nil, err
+	}
+	defer f.Close()
+
+	var all []domain.VSSDelayEvent
+	sc := bufio.NewScanner(f)
+	buf := make([]byte, 0, 64*1024)
+	sc.Buffer(buf, 1024*1024)
+
+	for sc.Scan() {
+		line := strings.TrimSpace(sc.Text())
+		if line == "" {
+			continue
+		}
+		var ev domain.VSSDelayEvent
+		if err := json.Unmarshal([]byte(line), &ev); err != nil {
+			continue
+		}
+		if ev.DeviceID == "" || ev.DeviceID == "SYSTEM" {
+			continue
+		}
+		all = append(all, ev)
+	}
+	if err := sc.Err(); err != nil {
+		return nil, err
+	}
+	return all, nil
 }

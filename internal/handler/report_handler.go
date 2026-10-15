@@ -26,7 +26,6 @@ func NewReportHandler(reportService service.ReportService) *ReportHandler {
 }
 
 func (h *ReportHandler) CreateReport(c *gin.Context) {
-	// Parse multipart form dulu
 	if err := c.Request.ParseMultipartForm(50 << 20); err != nil {
 		utils.Error(c, http.StatusBadRequest, "Failed to parse multipart form", err)
 		return

@@ -51,3 +51,31 @@ type VSSDelayListResult struct {
 	Page    int             `json:"page"`
 	PerPage int             `json:"per_page"`
 }
+
+type VSSDaySummaryDevice struct {
+	DeviceID	string	`json:"device_id"`
+	DeviceName	string	`json:"device_name"`
+	MaxDelaySec	int64	`json:"max_delay_sec"`
+	EventCount	int		`json:"event_count"`
+}
+
+type VSSDaySummary struct {
+	Date			string				`json:"date"`
+	TotalDevices	int					`json:"total_devices"`
+	DelayOver5Count	int					`json:"delay_over_5_count"`
+	TotalEvents		int					`json:"total_events"`
+	MaxDelaySec		int64				`json:"max_delay_sec"`
+	MaxDelayDevice	string				`json:"max_delay_device"`
+	MaxDelayDeviceID string				`json:"max_delay_device_id"`
+	Distribution	map[string]int		`json:"distribution"`
+	TopDevices		[]VSSDaySummaryDevice `json:"top_devices"`
+}
+
+type VSSDayDeviceDelayStat struct {
+	DeviceID   string  `json:"device_id"`
+	DeviceName string  `json:"device_name"`
+	MaxDelaySec int64  `json:"max_delay_sec"`
+	MinDelaySec int64  `json:"min_delay_sec"`
+	AvgDelaySec float64 `json:"avg_delay_sec"`
+	EventCount  int    `json:"event_count"`
+}

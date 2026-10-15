@@ -29,6 +29,8 @@ type VSSMonitorService interface {
 	ListHistory(filter repository.VSSHistoryFilter) ([]domain.VSSAlertHistory, int64, error)
 	ListLive(deviceName, action, status string, onlyIssue bool, page, perPage int, sortBy, sortDir string) *VSSLiveResult
 	GetTraffic() *VSSTrafficDetail
+	GetDaySummary(date string) (*domain.VSSDaySummary, error)
+	GetDayDelayExport(date string) ([]domain.VSSDayDeviceDelayStat, error)
 }
 
 type VSSDeviceLive struct {
@@ -450,6 +452,231 @@ func (s *vssMonitorService) GetTraffic() *VSSTrafficDetail {
 		Series:         series,
 		TrackedActions: tracked,
 	}
+}
+
+func categorizeDelaySec(sec int64) string {
+	s := sec
+	if s < 0 {
+		s = -s
+	}
+	if s <= 5 {
+		return "0-5s"
+	}
+	if s <= 60 {
+		return "5s-1m"
+	}
+	if s <= 300 {
+		return "1m-5m"
+	}
+	return ">5m"
+}
+
+func (s *vssMonitorService) GetDaySummary(date string) (*domain.VSSDaySummary, error) {
+	loc, _ := time.LoadLocation("Asia/Jakarta")
+	if loc == nil {
+		loc = time.FixedZone("WIB", 7*3600)
+	}
+
+	if strings.TrimSpace(date) == "" {
+		date = time.Now().In(loc).AddDate(0, 0, -1).Format("2006-01-02")
+	}
+
+	today := time.Now().In(loc).Format("2006-01-02")
+	if date >= today {
+		return nil, fmt.Errorf("the date must be before today (at the latest, yesterday)")
+	}
+
+	events, err := s.repo.ListAllByDate(date)
+	if err != nil {
+		return nil, err
+	}
+
+	dist := map[string]int{
+		"0-5s":  0,
+		"5s-1m": 0,
+		"1m-5m": 0,
+		">5m":   0,
+	}
+
+	type agg struct {
+		name    string
+		maxAbs  int64
+		maxRaw  int64
+		count   int
+		over5   bool
+	}
+	byDevice := map[string]*agg{}
+
+	var globalMaxAbs int64
+	var globalMaxRaw int64
+	maxName, maxID := "", ""
+
+	for _, ev := range events {
+		abs := ev.DelaySec
+		if abs < 0 {
+			abs = -abs
+		}
+
+		a, ok := byDevice[ev.DeviceID]
+		if !ok {
+			a = &agg{name: ev.DeviceName}
+			byDevice[ev.DeviceID] = a
+		}
+		if ev.DeviceName != "" {
+			a.name = ev.DeviceName
+		}
+		a.count++
+		if abs > a.maxAbs {
+			a.maxAbs = abs
+			a.maxRaw = ev.DelaySec
+		}
+
+		if ev.DelaySec > 5 || ev.DelaySec < 0 {
+			a.over5 = true
+		}
+
+		if abs > globalMaxAbs {
+			globalMaxAbs = abs
+			globalMaxRaw = ev.DelaySec
+			maxName = a.name
+			maxID = ev.DeviceID
+		}
+	}
+
+	for _, a := range byDevice {
+		cat := categorizeDelaySec(a.maxRaw)
+		dist[cat]++
+	}
+
+	over5Devices := 0
+	top := make([]domain.VSSDaySummaryDevice, 0, len(byDevice))
+	for id, a := range byDevice {
+		if a.over5 {
+			over5Devices++
+		}
+		if a.maxRaw <= 5 {
+			continue
+		}
+		name := a.name
+		if name == "" {
+			name = id
+		}
+		top = append(top, domain.VSSDaySummaryDevice{
+			DeviceID:    id,
+			DeviceName:  name,
+			MaxDelaySec: a.maxRaw,
+			EventCount:  a.count,
+		})
+	}
+
+	sort.Slice(top, func(i, j int) bool {
+		if top[i].MaxDelaySec == top[j].MaxDelaySec {
+			return top[i].DeviceName < top[j].DeviceName
+		}
+		return top[i].MaxDelaySec > top[j].MaxDelaySec
+	})
+	if len(top) > 10 {
+		top = top[:10]
+	}
+
+	return &domain.VSSDaySummary{
+		Date:             date,
+		TotalDevices:     len(byDevice),
+		DelayOver5Count:  over5Devices,
+		TotalEvents:      len(events),
+		MaxDelaySec:      globalMaxRaw,
+		MaxDelayDevice:   maxName,
+		MaxDelayDeviceID: maxID,
+		Distribution:     dist,
+		TopDevices:       top,
+	}, nil
+}
+
+func (s *vssMonitorService) GetDayDelayExport(date string) ([]domain.VSSDayDeviceDelayStat, error) {
+	loc, _ := time.LoadLocation("Asia/Jakarta")
+	if loc == nil {
+		loc = time.FixedZone("WIB", 7*3600)
+	}
+
+	if strings.TrimSpace(date) == "" {
+		date = time.Now().In(loc).AddDate(0, 0, -1).Format("2006-01-02")
+	}
+
+	today := time.Now().In(loc).Format("2006-01-02")
+	if date >= today {
+		return nil, fmt.Errorf("the date must be before today (at the latest, yesterday)")
+	}
+
+	events, err := s.repo.ListAllByDate(date)
+	if err != nil {
+		return nil, err
+	}
+
+	type agg struct {
+		name string
+		max  int64
+		min  int64
+		sum  int64
+		n    int
+	}
+	byDevice := map[string]*agg{}
+
+	for _, ev := range events {
+		if ev.DelaySec <= 5 && ev.DelaySec >= 0 {
+			continue
+		}
+
+		a, ok := byDevice[ev.DeviceID]
+		if !ok {
+			a = &agg{
+				name: ev.DeviceName,
+				max:  ev.DelaySec,
+				min:  ev.DelaySec,
+			}
+			byDevice[ev.DeviceID] = a
+		}
+		if ev.DeviceName != "" {
+			a.name = ev.DeviceName
+		}
+		a.n++
+		a.sum += ev.DelaySec
+		if ev.DelaySec > a.max {
+			a.max = ev.DelaySec
+		}
+		if ev.DelaySec < a.min {
+			a.min = ev.DelaySec
+		}
+	}
+
+	out := make([]domain.VSSDayDeviceDelayStat, 0, len(byDevice))
+	for id, a := range byDevice {
+		name := a.name
+		if name == "" {
+			name = id
+		}
+		avg := 0.0
+		if a.n > 0 {
+			avg = float64(a.sum) / float64(a.n)
+		}
+		out = append(out, domain.VSSDayDeviceDelayStat{
+			DeviceID:    id,
+			DeviceName:  name,
+			MaxDelaySec: a.max,
+			MinDelaySec: a.min,
+			AvgDelaySec: avg,
+			EventCount:  a.n,
+		})
+	}
+
+	// Sort seperti top 10: delay max tertinggi dulu, negatif paling bawah
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].MaxDelaySec == out[j].MaxDelaySec {
+			return out[i].DeviceName < out[j].DeviceName
+		}
+		return out[i].MaxDelaySec > out[j].MaxDelaySec
+	})
+
+	return out, nil
 }
 
 func (s *vssMonitorService) login() (token, pid string, err error) {
