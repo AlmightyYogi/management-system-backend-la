@@ -324,6 +324,7 @@ func (s *vssMonitorService) ListLive(deviceName, action, status string, onlyIssu
 	st := strings.ToUpper(strings.TrimSpace(status))
 
 	s.mu.Lock()
+	now := time.Now()
 	defer s.mu.Unlock()
 
 	all := make([]VSSDeviceLive, 0, len(s.live))
@@ -357,9 +358,22 @@ func (s *vssMonitorService) ListLive(deviceName, action, status string, onlyIssu
 		}
 
 		cp := *v
-		if len(cp.Reasons) == 0 && cp.DelaySec >= int64(s.cfg.DelayThresholdSec) {
-			cp.Status = "DELAYED"
+
+		offline := false
+		if cp.LastSeen != "" {
+			if t, err := time.Parse(time.RFC3339, cp.LastSeen); err == nil {
+				if now.Sub(t) >= time.Hour {
+					offline = true
+					cp.Status = "OFFLINE"
+				}
+			}
 		}
+		if !offline {
+			if len(cp.Reasons) == 0 && cp.DelaySec >= int64(s.cfg.DelayThresholdSec) {
+				cp.Status = "DELAYED"
+			}
+		}
+
 		all = append(all, cp)
 	}
 
@@ -459,8 +473,11 @@ func categorizeDelaySec(sec int64) string {
 	if s < 0 {
 		s = -s
 	}
+	if s == 0 {
+		return "0s"
+	}
 	if s <= 5 {
-		return "0-5s"
+		return "1s-5s"
 	}
 	if s <= 60 {
 		return "5s-1m"
@@ -491,25 +508,25 @@ func (s *vssMonitorService) GetDaySummary(date string) (*domain.VSSDaySummary, e
 		return nil, err
 	}
 
+	const offlineDelaySec int64 = 3600
+
 	dist := map[string]int{
-		"0-5s":  0,
+		"0s":    0,
+		"1s-5s": 0,
 		"5s-1m": 0,
 		"1m-5m": 0,
 		">5m":   0,
 	}
 
 	type agg struct {
-		name    string
-		maxAbs  int64
-		maxRaw  int64
-		count   int
-		over5   bool
+		name     string
+		maxAbs   int64
+		maxRaw   int64
+		count    int
+		over5    bool
+		hasValid bool
 	}
 	byDevice := map[string]*agg{}
-
-	var globalMaxAbs int64
-	var globalMaxRaw int64
-	maxName, maxID := "", ""
 
 	for _, ev := range events {
 		abs := ev.DelaySec
@@ -526,24 +543,27 @@ func (s *vssMonitorService) GetDaySummary(date string) (*domain.VSSDaySummary, e
 			a.name = ev.DeviceName
 		}
 		a.count++
+
+		if abs >= offlineDelaySec {
+			continue
+		}
+
+		a.hasValid = true
+
 		if abs > a.maxAbs {
 			a.maxAbs = abs
 			a.maxRaw = ev.DelaySec
 		}
 
-		if ev.DelaySec > 5 || ev.DelaySec < 0 {
+		if ev.DelaySec != 0 {
 			a.over5 = true
-		}
-
-		if abs > globalMaxAbs {
-			globalMaxAbs = abs
-			globalMaxRaw = ev.DelaySec
-			maxName = a.name
-			maxID = ev.DeviceID
 		}
 	}
 
 	for _, a := range byDevice {
+		if !a.hasValid {
+			continue
+		}
 		cat := categorizeDelaySec(a.maxRaw)
 		dist[cat]++
 	}
@@ -551,10 +571,13 @@ func (s *vssMonitorService) GetDaySummary(date string) (*domain.VSSDaySummary, e
 	over5Devices := 0
 	top := make([]domain.VSSDaySummaryDevice, 0, len(byDevice))
 	for id, a := range byDevice {
+		if !a.hasValid {
+			continue
+		}
 		if a.over5 {
 			over5Devices++
 		}
-		if a.maxRaw <= 5 {
+		if a.maxRaw <= 0 {
 			continue
 		}
 		name := a.name
@@ -577,6 +600,14 @@ func (s *vssMonitorService) GetDaySummary(date string) (*domain.VSSDaySummary, e
 	})
 	if len(top) > 10 {
 		top = top[:10]
+	}
+
+	var globalMaxRaw int64
+	maxName, maxID := "", ""
+	if len(top) > 0 {
+		globalMaxRaw = top[0].MaxDelaySec
+		maxName = top[0].DeviceName
+		maxID = top[0].DeviceID
 	}
 
 	return &domain.VSSDaySummary{
@@ -621,8 +652,17 @@ func (s *vssMonitorService) GetDayDelayExport(date string) ([]domain.VSSDayDevic
 	}
 	byDevice := map[string]*agg{}
 
+	const offlineDelaySec int64 = 3600
+
 	for _, ev := range events {
-		if ev.DelaySec <= 5 && ev.DelaySec >= 0 {
+		if ev.DelaySec == 0 {
+			continue
+		}
+		abs := ev.DelaySec
+		if abs < 0 {
+			abs = -abs
+		}
+		if abs >= offlineDelaySec {
 			continue
 		}
 
