@@ -519,7 +519,7 @@ func (s *vssMonitorService) GetDaySummary(date string) (*domain.VSSDaySummary, e
 		">5m":   0,
 	}
 
-		type agg struct {
+	type agg struct {
 		name     string
 		min      int64
 		max      int64
@@ -564,14 +564,16 @@ func (s *vssMonitorService) GetDaySummary(date string) (*domain.VSSDaySummary, e
 		a.n++
 	}
 
+		const minAvgDelaySec int64 = 3
+
 	type deviceStat struct {
-		id       string
-		name     string
-		min      int64
-		max      int64
-		avg      float64
-		avgSec   int64
-		n        int
+		id     string
+		name   string
+		min    int64
+		max    int64
+		avg    float64
+		avgSec int64
+		n      int
 	}
 
 	stats := make([]deviceStat, 0, len(byDevice))
@@ -586,29 +588,27 @@ func (s *vssMonitorService) GetDaySummary(date string) (*domain.VSSDaySummary, e
 			name = id
 		}
 		stats = append(stats, deviceStat{
-			id:     id,
-			name:   name,
-			min:    a.min,
-			max:    a.max,
-			avg:    avg,
-			avgSec: avgSec,
-			n:      a.n,
+			id: id, name: name,
+			min: a.min, max: a.max,
+			avg: avg, avgSec: avgSec, n: a.n,
 		})
 	}
 
+	delayed := make([]deviceStat, 0, len(stats))
 	over5Devices := 0
 	for _, st := range stats {
+		if st.avgSec <= minAvgDelaySec {
+			continue
+		}
+		delayed = append(delayed, st)
 		dist[categorizeDelaySec(st.avgSec)]++
 		if st.avgSec > 5 {
 			over5Devices++
 		}
 	}
 
-	top := make([]domain.VSSDaySummaryDevice, 0, len(stats))
-	for _, st := range stats {
-		if st.avgSec <= 0 {
-			continue
-		}
+	top := make([]domain.VSSDaySummaryDevice, 0, len(delayed))
+	for _, st := range delayed {
 		top = append(top, domain.VSSDaySummaryDevice{
 			DeviceID:    st.id,
 			DeviceName:  st.name,
@@ -616,7 +616,6 @@ func (s *vssMonitorService) GetDaySummary(date string) (*domain.VSSDaySummary, e
 			EventCount:  st.n,
 		})
 	}
-
 	sort.Slice(top, func(i, j int) bool {
 		if top[i].MaxDelaySec == top[j].MaxDelaySec {
 			return top[i].DeviceName < top[j].DeviceName
@@ -636,15 +635,15 @@ func (s *vssMonitorService) GetDaySummary(date string) (*domain.VSSDaySummary, e
 	}
 
 	return &domain.VSSDaySummary{
-		Date:             date,
-		TotalDevices:     len(stats),
-		DelayOver5Count:  over5Devices,
-		TotalEvents:      len(events),
-		MaxDelaySec:      globalMaxAvg,
-		MaxDelayDevice:   maxName,
+		Date: date,
+		TotalDevices: len(stats),
+		DelayOver5Count: over5Devices,
+		TotalEvents:     len(events),
+		MaxDelaySec:     globalMaxAvg,
+		MaxDelayDevice:  maxName,
 		MaxDelayDeviceID: maxID,
-		Distribution:     dist,
-		TopDevices:       top,
+		Distribution: dist,
+		TopDevices:   top,
 	}, nil
 }
 
@@ -1006,6 +1005,7 @@ func (s *vssMonitorService) tryUpsertFromAny(action string, raw json.RawMessage)
 	s.mu.Unlock()
 
 	s.upsertLive(p, action, delaySec, false, reasons, now, time.Time{})
+	s.persistDelaySample(p, delaySec, now, action)
 	return true
 }
 
@@ -1139,6 +1139,58 @@ func (s *vssMonitorService) persistIfNotSpam(
 
 	if s.reasonAllowedForEmail(reason) {
 		s.enqueueAlert(ev)
+	}
+}
+
+func (s *vssMonitorService) persistDelaySample(
+	p statusPayload,
+	delaySec int64,
+	now time.Time,
+	action string,
+) {
+	const sampleReason = "delay_sample"
+	sampleWindow := 5 * time.Minute
+
+	abs := delaySec
+	if abs < 0 {
+		abs = -abs
+	}
+	if abs >= 3600 {
+		return
+	}
+
+	exists, err := s.repo.ExistsRecent(p.DeviceID, sampleReason, sampleWindow)
+	if err != nil || exists {
+		return
+	}
+
+	loc, _ := time.LoadLocation("Asia/Jakarta")
+	if loc == nil {
+		loc = time.FixedZone("WIB", 7*3600)
+	}
+	detected := now.In(loc).Format(time.RFC3339)
+
+	msg := fmt.Sprintf(
+		"VSS | sample | action=%s | device=%s (%s) | delay=%ds | dtu=%s",
+		action, p.DeviceID, p.Ext.DeviceName, delaySec, p.DTU,
+	)
+	
+	ev := domain.VSSDelayEvent{
+		DetectedAt: detected,
+		DeviceID:   p.DeviceID,
+		DeviceName: p.Ext.DeviceName,
+		NodeID:     p.NodeID,
+		DTU:        p.DTU,
+		ReportTime: p.Ext.ReportTime,
+		IsLater:    p.IsLater == "1" || p.Ext.IsLater,
+		DelaySec:   delaySec,
+		Reason:     sampleReason,
+		Message:    msg,
+		Action:     action,
+	}
+
+	if err := s.repo.Append(ev); err != nil {
+		log.Printf("[VSS] write delay sample error: %v", err)
 	}
 }
 
@@ -1325,6 +1377,8 @@ func (s *vssMonitorService) handleStatus80003(raw json.RawMessage) {
 	}
 
 	s.upsertLive(p, "80003", delaySec, isLater, reasons, now, time.Time{})
+
+	s.persistDelaySample(p, delaySec, now, "80003")
 
 	for _, r := range reasons {
 		if !s.reasonAllowedForLog(r) {
