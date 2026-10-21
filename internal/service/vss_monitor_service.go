@@ -12,6 +12,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"math"
 	"time"
 
 	"github.com/AlmightyOggy/management-system/internal/config"
@@ -518,12 +519,12 @@ func (s *vssMonitorService) GetDaySummary(date string) (*domain.VSSDaySummary, e
 		">5m":   0,
 	}
 
-	type agg struct {
+		type agg struct {
 		name     string
-		maxAbs   int64
-		maxRaw   int64
-		count    int
-		over5    bool
+		min      int64
+		max      int64
+		sum      int64
+		n        int
 		hasValid bool
 	}
 	byDevice := map[string]*agg{}
@@ -542,53 +543,77 @@ func (s *vssMonitorService) GetDaySummary(date string) (*domain.VSSDaySummary, e
 		if ev.DeviceName != "" {
 			a.name = ev.DeviceName
 		}
-		a.count++
 
 		if abs >= offlineDelaySec {
 			continue
 		}
 
-		a.hasValid = true
-
-		if abs > a.maxAbs {
-			a.maxAbs = abs
-			a.maxRaw = ev.DelaySec
-		}
-
-		if ev.DelaySec != 0 {
-			a.over5 = true
-		}
-	}
-
-	for _, a := range byDevice {
 		if !a.hasValid {
-			continue
+			a.min = ev.DelaySec
+			a.max = ev.DelaySec
+			a.hasValid = true
+		} else {
+			if ev.DelaySec < a.min {
+				a.min = ev.DelaySec
+			}
+			if ev.DelaySec > a.max {
+				a.max = ev.DelaySec
+			}
 		}
-		cat := categorizeDelaySec(a.maxRaw)
-		dist[cat]++
+		a.sum += ev.DelaySec
+		a.n++
 	}
 
-	over5Devices := 0
-	top := make([]domain.VSSDaySummaryDevice, 0, len(byDevice))
+	type deviceStat struct {
+		id       string
+		name     string
+		min      int64
+		max      int64
+		avg      float64
+		avgSec   int64
+		n        int
+	}
+
+	stats := make([]deviceStat, 0, len(byDevice))
 	for id, a := range byDevice {
-		if !a.hasValid {
+		if !a.hasValid || a.n == 0 {
 			continue
 		}
-		if a.over5 {
-			over5Devices++
-		}
-		if a.maxRaw <= 0 {
-			continue
-		}
+		avg := float64(a.sum) / float64(a.n)
+		avgSec := int64(math.Round(avg))
 		name := a.name
 		if name == "" {
 			name = id
 		}
+		stats = append(stats, deviceStat{
+			id:     id,
+			name:   name,
+			min:    a.min,
+			max:    a.max,
+			avg:    avg,
+			avgSec: avgSec,
+			n:      a.n,
+		})
+	}
+
+	over5Devices := 0
+	for _, st := range stats {
+		dist[categorizeDelaySec(st.avgSec)]++
+		if st.avgSec > 5 {
+			over5Devices++
+		}
+	}
+
+	top := make([]domain.VSSDaySummaryDevice, 0, len(stats))
+	for _, st := range stats {
+		if st.avgSec <= 0 {
+			continue
+		}
 		top = append(top, domain.VSSDaySummaryDevice{
-			DeviceID:    id,
-			DeviceName:  name,
-			MaxDelaySec: a.maxRaw,
-			EventCount:  a.count,
+			DeviceID:    st.id,
+			DeviceName:  st.name,
+			MaxDelaySec: st.avgSec,
+			EventCount:  st.n,
 		})
 	}
 
@@ -602,20 +627,20 @@ func (s *vssMonitorService) GetDaySummary(date string) (*domain.VSSDaySummary, e
 		top = top[:10]
 	}
 
-	var globalMaxRaw int64
+	var globalMaxAvg int64
 	maxName, maxID := "", ""
 	if len(top) > 0 {
-		globalMaxRaw = top[0].MaxDelaySec
+		globalMaxAvg = top[0].MaxDelaySec
 		maxName = top[0].DeviceName
 		maxID = top[0].DeviceID
 	}
 
 	return &domain.VSSDaySummary{
 		Date:             date,
-		TotalDevices:     len(byDevice),
+		TotalDevices:     len(stats),
 		DelayOver5Count:  over5Devices,
 		TotalEvents:      len(events),
-		MaxDelaySec:      globalMaxRaw,
+		MaxDelaySec:      globalMaxAvg,
 		MaxDelayDevice:   maxName,
 		MaxDelayDeviceID: maxID,
 		Distribution:     dist,
@@ -654,10 +679,7 @@ func (s *vssMonitorService) GetDayDelayExport(date string) ([]domain.VSSDayDevic
 
 	const offlineDelaySec int64 = 3600
 
-	for _, ev := range events {
-		if ev.DelaySec == 0 {
-			continue
-		}
+		for _, ev := range events {
 		abs := ev.DelaySec
 		if abs < 0 {
 			abs = -abs
