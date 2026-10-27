@@ -8,11 +8,12 @@ import (
 )
 
 type Config struct {
-	App			AppConfig		`mapstructure:"app"`
-	Database	DatabaseConfig	`mapstructure:"db"`
-	JWT			JWTConfig		`mapstructure:"jwt"`
-	Email		EmailConfig		`mapstructure:"email"`
-	VSS      	VSSConfig      	`mapstructure:"vss"`
+	App				AppConfig		`mapstructure:"app"`
+	Database		DatabaseConfig	`mapstructure:"db"`
+	JWT				JWTConfig		`mapstructure:"jwt"`
+	Email			EmailConfig		`mapstructure:"email"`
+	VSS      		VSSConfig      	`mapstructure:"vss"`
+	VSSReportEmail 	VSSReportEmailConfig
 }
 
 type EmailConfig struct {
@@ -61,6 +62,18 @@ type DatabaseConfig struct {
 	MaxIdleConns	int
 	MaxOpenConns	int
 	ConnMaxLifetime	time.Duration
+}
+
+type VSSReportEmailConfig struct {
+	Enabled       bool
+	SMTPHost      string
+	SMTPPort      int
+	SMTPSecurity  string
+	FromEmail     string
+	FromName      string
+	ToEmails      string
+	Hour          int
+	Minute        int
 }
 
 type JWTConfig struct {
@@ -146,6 +159,17 @@ func LoadConfig() {
 			EmailDigestMin:  	viper.GetInt("VSS_EMAIL_DIGEST_MIN"),
 			EmailMinDevices: 	viper.GetInt("VSS_EMAIL_MIN_DEVICES"),
 		},
+		VSSReportEmail: VSSReportEmailConfig{
+			Enabled:      viper.GetBool("VSS_REPORT_EMAIL_ENABLED"),
+			SMTPHost:     viper.GetString("VSS_REPORT_SMTP_HOST"),
+			SMTPPort:     viper.GetInt("VSS_REPORT_SMTP_PORT"),
+			SMTPSecurity: viper.GetString("VSS_REPORT_SMTP_SECURITY"),
+			FromEmail:    viper.GetString("VSS_REPORT_FROM_EMAIL"),
+			FromName:     viper.GetString("VSS_REPORT_FROM_NAME"),
+			ToEmails:     viper.GetString("VSS_REPORT_TO_EMAILS"),
+			Hour:         viper.GetInt("VSS_REPORT_HOUR"),
+			Minute:       viper.GetInt("VSS_REPORT_MINUTE"),
+		},
 	}
 
 	if AppConfigInstance.VSS.LoginURL == "" {
@@ -171,6 +195,29 @@ func LoadConfig() {
 	}
 	if AppConfigInstance.VSS.EmailMode == "" {
 		AppConfigInstance.VSS.EmailMode = "digest"
+	}
+
+	re := &AppConfigInstance.VSSReportEmail
+	if re.SMTPHost == "" {
+		re.SMTPHost = "smtpgw2.ioh.co.id"
+	}
+	if re.SMTPPort <= 0 {
+		re.SMTPPort = 25
+	}
+	if re.SMTPSecurity == "" {
+		re.SMTPSecurity = "none"
+	}
+	if re.FromEmail == "" {
+		re.FromEmail = "b2bops_alert_noreply@ioh.co.id"
+	}
+	if re.FromName == "" {
+		re.FromName = "VSS Monitor"
+	}
+	if re.Hour < 0 || re.Hour > 23 {
+		re.Hour = 7
+	}
+	if re.Minute < 0 || re.Minute > 59 {
+		re.Minute = 0
 	}
 }
 

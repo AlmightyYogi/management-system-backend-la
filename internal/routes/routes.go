@@ -80,6 +80,7 @@ func SetupRoutes(r *gin.Engine, reportHandler *handler.ReportHandler, userHandle
 		vss.GET("/traffic", vssHandler.GetTraffic)
 		vss.GET("/summary", vssHandler.GetDaySummary)
 		vss.GET("/summary/export", vssHandler.ExportDayDelayExcel)
+		vss.GET("/report/send", vssHandler.SendDailyReport)
 	}
 
 	r.GET("/health", func(c *gin.Context) {

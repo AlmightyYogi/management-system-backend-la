@@ -14,6 +14,7 @@ import (
 	"sync"
 	"math"
 	"time"
+	"github.com/xuri/excelize/v2"
 
 	"github.com/AlmightyOggy/management-system/internal/config"
 	"github.com/AlmightyOggy/management-system/internal/domain"
@@ -32,6 +33,7 @@ type VSSMonitorService interface {
 	GetTraffic() *VSSTrafficDetail
 	GetDaySummary(date string) (*domain.VSSDaySummary, error)
 	GetDayDelayExport(date string) ([]domain.VSSDayDeviceDelayStat, error)
+	SendDailyReport(date string) error
 }
 
 type VSSDeviceLive struct {
@@ -253,6 +255,7 @@ func (s *vssMonitorService) Start(ctx context.Context) {
 	go s.staleChecker(ctx)
 	go s.logCleanup(ctx)
 	go s.emailDigestLoop(ctx)
+	go s.dailyReportLoop(ctx)
 	log.Println("[VSS] monitor started")
 }
 
@@ -360,10 +363,13 @@ func (s *vssMonitorService) ListLive(deviceName, action, status string, onlyIssu
 
 		cp := *v
 
+		const (
+			vssOfflineAfter = 6 * time.Hour
+		)
 		offline := false
 		if cp.LastSeen != "" {
 			if t, err := time.Parse(time.RFC3339, cp.LastSeen); err == nil {
-				if now.Sub(t) >= time.Hour {
+				if now.Sub(t) >= vssOfflineAfter {
 					offline = true
 					cp.Status = "OFFLINE"
 				}
@@ -509,8 +515,6 @@ func (s *vssMonitorService) GetDaySummary(date string) (*domain.VSSDaySummary, e
 		return nil, err
 	}
 
-	const offlineDelaySec int64 = 3600
-
 	dist := map[string]int{
 		"0s":    0,
 		"1s-5s": 0,
@@ -530,11 +534,6 @@ func (s *vssMonitorService) GetDaySummary(date string) (*domain.VSSDaySummary, e
 	byDevice := map[string]*agg{}
 
 	for _, ev := range events {
-		abs := ev.DelaySec
-		if abs < 0 {
-			abs = -abs
-		}
-
 		a, ok := byDevice[ev.DeviceID]
 		if !ok {
 			a = &agg{name: ev.DeviceName}
@@ -542,10 +541,6 @@ func (s *vssMonitorService) GetDaySummary(date string) (*domain.VSSDaySummary, e
 		}
 		if ev.DeviceName != "" {
 			a.name = ev.DeviceName
-		}
-
-		if abs >= offlineDelaySec {
-			continue
 		}
 
 		if !a.hasValid {
@@ -676,17 +671,7 @@ func (s *vssMonitorService) GetDayDelayExport(date string) ([]domain.VSSDayDevic
 	}
 	byDevice := map[string]*agg{}
 
-	const offlineDelaySec int64 = 3600
-
-		for _, ev := range events {
-		abs := ev.DelaySec
-		if abs < 0 {
-			abs = -abs
-		}
-		if abs >= offlineDelaySec {
-			continue
-		}
-
+	for _, ev := range events {
 		a, ok := byDevice[ev.DeviceID]
 		if !ok {
 			a = &agg{
@@ -1773,6 +1758,325 @@ func (s *vssMonitorService) emailDigestLoop(ctx context.Context) {
 			s.flushAlertDigest()
 		}
 	}
+}
+
+func (s *vssMonitorService) dailyReportLoop(ctx context.Context) {
+	cfg := config.GetConfig()
+	r := cfg.VSSReportEmail
+	if !r.Enabled {
+		log.Println("[VSS] daily report email disabled")
+		return
+	}
+	if r.SMTPHost == "" || r.FromEmail == "" || strings.TrimSpace(r.ToEmails) == "" {
+		log.Println("[VSS] daily report email skipped: incomplete config")
+		return
+	}
+
+	log.Printf("[VSS] daily report scheduler enabled at %02d:%02d WIB → %s",
+		r.Hour, r.Minute, r.ToEmails)
+
+	var lastSentDate string
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			loc, _ := time.LoadLocation("Asia/Jakarta")
+			if loc == nil {
+				loc = time.FixedZone("WIB", 7*3600)
+			}
+			now := time.Now().In(loc)
+			if now.Hour() != r.Hour || now.Minute() != r.Minute {
+				continue
+			}
+			todayKey := now.Format("2006-01-02")
+			if lastSentDate == todayKey {
+				continue
+			}
+
+			reportDate := now.AddDate(0, 0, -1).Format("2006-01-02")
+			if err := s.SendDailyReport(reportDate); err != nil {
+				log.Printf("[VSS] daily report failed date=%s: %v", reportDate, err)
+				continue
+			}
+			lastSentDate = todayKey
+			log.Printf("[VSS] daily report sent date=%s", reportDate)
+		}
+	}
+}
+
+func (s *vssMonitorService) SendDailyReport(date string) error {
+	cfg := config.GetConfig()
+	r := cfg.VSSReportEmail
+	if !r.Enabled {
+		return fmt.Errorf("VSS report email disabled")
+	}
+
+	loc, _ := time.LoadLocation("Asia/Jakarta")
+	if loc == nil {
+		loc = time.FixedZone("WIB", 7*3600)
+	}
+	if strings.TrimSpace(date) == "" {
+		date = time.Now().In(loc).AddDate(0, 0, -1).Format("2006-01-02")
+	}
+
+	summary, err := s.GetDaySummary(date)
+	if err != nil {
+		return fmt.Errorf("summary: %w", err)
+	}
+
+	rows, err := s.GetDayDelayExport(date)
+	if err != nil {
+		return fmt.Errorf("export rows: %w", err)
+	}
+
+	xlsxBytes, err := buildDayDelayExcel(date, rows)
+	if err != nil {
+		return fmt.Errorf("excel: %w", err)
+	}
+
+	html := buildVSSDailyReportHTML(summary)
+	subject := fmt.Sprintf("[VSS Rekap] %s — %d device · %d event",
+		summary.Date, summary.TotalDevices, summary.TotalEvents)
+
+	to := utils.ParseEmailList(r.ToEmails)
+	if len(to) == 0 {
+		return fmt.Errorf("no recipients in VSS_REPORT_TO_EMAILS")
+	}
+
+	filename := fmt.Sprintf("vss-rekap-delay-%s.xlsx", date)
+	return utils.SendVSSReportEmail(to, subject, html, map[string][]byte{
+		filename: xlsxBytes,
+	})
+}
+
+func buildDayDelayExcel(date string, rows []domain.VSSDayDeviceDelayStat) ([]byte, error) {
+	f := excelize.NewFile()
+	sheet := "Rekap Delay"
+	_ = f.SetSheetName("Sheet1", sheet)
+
+	headers := []string{"No", "Name", "Device ID", "Delay Max", "Delay Min", "Delay Avg"}
+	for i, htxt := range headers {
+		cell, _ := excelize.CoordinatesToCellName(i+1, 1)
+		_ = f.SetCellValue(sheet, cell, htxt)
+	}
+	headerStyle, _ := f.NewStyle(&excelize.Style{
+		Font:      &excelize.Font{Bold: true, Color: "FFFFFF"},
+		Fill:      excelize.Fill{Type: "pattern", Color: []string{"6366F1"}, Pattern: 1},
+		Alignment: &excelize.Alignment{Horizontal: "center"},
+	})
+	_ = f.SetCellStyle(sheet, "A1", "F1", headerStyle)
+
+	formatSec := func(sec int64) string {
+		neg := sec < 0
+		s := sec
+		if s < 0 {
+			s = -s
+		}
+		var out string
+		if s < 60 {
+			out = fmt.Sprintf("%ds", s)
+		} else {
+			h := s / 3600
+			m := (s % 3600) / 60
+			secR := s % 60
+			parts := []string{}
+			if h > 0 {
+				parts = append(parts, fmt.Sprintf("%dh", h))
+			}
+			if m > 0 {
+				parts = append(parts, fmt.Sprintf("%dm", m))
+			}
+			if secR > 0 || len(parts) == 0 {
+				parts = append(parts, fmt.Sprintf("%ds", secR))
+			}
+			out = strings.Join(parts, " ")
+		}
+		if neg {
+			return "-" + out
+		}
+		return out
+	}
+
+	for i, r := range rows {
+		row := i + 2
+		_ = f.SetCellValue(sheet, fmt.Sprintf("A%d", row), i+1)
+		_ = f.SetCellValue(sheet, fmt.Sprintf("B%d", row), r.DeviceName)
+		_ = f.SetCellValue(sheet, fmt.Sprintf("C%d", row), r.DeviceID)
+		_ = f.SetCellValue(sheet, fmt.Sprintf("D%d", row), formatSec(r.MaxDelaySec))
+		_ = f.SetCellValue(sheet, fmt.Sprintf("E%d", row), formatSec(r.MinDelaySec))
+		_ = f.SetCellValue(sheet, fmt.Sprintf("F%d", row), formatSec(int64(r.AvgDelaySec+0.5)))
+	}
+	_ = f.SetColWidth(sheet, "A", "A", 6)
+	_ = f.SetColWidth(sheet, "B", "B", 18)
+	_ = f.SetColWidth(sheet, "C", "C", 22)
+	_ = f.SetColWidth(sheet, "D", "F", 14)
+
+	buf, err := f.WriteToBuffer()
+	if err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
+}
+
+func formatDelayHuman(sec int64) string {
+	neg := sec < 0
+	s := sec
+	if s < 0 {
+		s = -s
+	}
+	var out string
+	if s < 60 {
+		out = fmt.Sprintf("%ds", s)
+	} else {
+		h := s / 3600
+		m := (s % 3600) / 60
+		secR := s % 60
+		parts := []string{}
+		if h > 0 {
+			parts = append(parts, fmt.Sprintf("%dh", h))
+		}
+		if m > 0 {
+			parts = append(parts, fmt.Sprintf("%dm", m))
+		}
+		if secR > 0 || len(parts) == 0 {
+			parts = append(parts, fmt.Sprintf("%ds", secR))
+		}
+		out = strings.Join(parts, " ")
+	}
+	if neg {
+		return "-" + out
+	}
+	return out
+}
+
+func buildVSSDailyReportHTML(sum *domain.VSSDaySummary) string {
+	if sum == nil {
+		return "<p>Tidak ada data</p>"
+	}
+
+	pieTotal := 0
+	if sum.Distribution != nil {
+		for _, k := range []string{"1s-5s", "5s-1m", "1m-5m", ">5m"} {
+			pieTotal += sum.Distribution[k]
+		}
+	}
+
+	var topRows strings.Builder
+	for i, d := range sum.TopDevices {
+		if i >= 10 {
+			break
+		}
+		topRows.WriteString(fmt.Sprintf(`
+			<tr>
+				<td style="padding:8px 12px;border-bottom:1px solid #f1f5f9;">%d</td>
+				<td style="padding:8px 12px;border-bottom:1px solid #f1f5f9;font-weight:600;">%s</td>
+				<td style="padding:8px 12px;border-bottom:1px solid #f1f5f9;font-family:monospace;font-size:12px;">%s</td>
+				<td style="padding:8px 12px;border-bottom:1px solid #f1f5f9;color:#dc2626;font-weight:700;">%s</td>
+			</tr>`,
+			i+1, d.DeviceName, d.DeviceID, formatDelayHuman(d.MaxDelaySec),
+		))
+	}
+	if topRows.Len() == 0 {
+		topRows.WriteString(`<tr><td colspan="4" style="padding:16px;text-align:center;color:#94a3b8;">Tidak ada device avg delay &gt; 3 detik</td></tr>`)
+	}
+
+	distLine := ""
+	if sum.Distribution != nil {
+		distLine = fmt.Sprintf(
+			"3–5s: %d · 5s–1m: %d · 1–5m: %d · &gt;5m: %d",
+			sum.Distribution["1s-5s"],
+			sum.Distribution["5s-1m"],
+			sum.Distribution["1m-5m"],
+			sum.Distribution[">5m"],
+		)
+	}
+
+	return fmt.Sprintf(`<!DOCTYPE html>
+<html lang="id"><head><meta charset="UTF-8"><title>VSS Rekap %s</title></head>
+<body style="margin:0;padding:0;background:#f3f4f6;font-family:'Segoe UI',Arial,sans-serif;">
+<table width="100%%" cellpadding="0" cellspacing="0" style="background:#f3f4f6;padding:24px 0;">
+<tr><td align="center">
+<table width="640" style="max-width:640px;width:100%%;background:#fff;border-radius:12px;overflow:hidden;box-shadow:0 4px 20px rgba(0,0,0,.08);">
+  <tr>
+    <td style="background:linear-gradient(135deg,#1e3a5f,#2563eb);padding:24px 28px;text-align:center;">
+      <div style="color:#fff;font-size:13px;opacity:.85;margin-bottom:6px;">VSS Monitor · Laporan Harian</div>
+      <h1 style="color:#fff;margin:0;font-size:20px;">Rekap Delay %s</h1>
+      <p style="color:rgba(255,255,255,.8);margin:8px 0 0;font-size:13px;">00:00 – 23:59 WIB · dikirim otomatis</p>
+    </td>
+  </tr>
+  <tr><td style="padding:24px 28px;">
+    <table width="100%%" cellpadding="0" cellspacing="0" style="margin-bottom:20px;">
+      <tr>
+        <td style="width:25%%;padding:10px;background:#f8fafc;border:1px solid #e2e8f0;border-radius:8px;text-align:center;">
+          <div style="font-size:11px;color:#94a3b8;text-transform:uppercase;">Total device</div>
+          <div style="font-size:22px;font-weight:700;color:#1e293b;">%d</div>
+        </td>
+        <td style="width:8px;"></td>
+        <td style="width:25%%;padding:10px;background:#f8fafc;border:1px solid #e2e8f0;border-radius:8px;text-align:center;">
+          <div style="font-size:11px;color:#94a3b8;text-transform:uppercase;">Avg &gt; 3s</div>
+          <div style="font-size:22px;font-weight:700;color:#1e293b;">%d</div>
+        </td>
+        <td style="width:8px;"></td>
+        <td style="width:25%%;padding:10px;background:#f8fafc;border:1px solid #e2e8f0;border-radius:8px;text-align:center;">
+          <div style="font-size:11px;color:#94a3b8;text-transform:uppercase;">Delay tertinggi</div>
+          <div style="font-size:18px;font-weight:700;color:#dc2626;">%s</div>
+        </td>
+        <td style="width:8px;"></td>
+        <td style="width:25%%;padding:10px;background:#f8fafc;border:1px solid #e2e8f0;border-radius:8px;text-align:center;">
+          <div style="font-size:11px;color:#94a3b8;text-transform:uppercase;">Total event</div>
+          <div style="font-size:22px;font-weight:700;color:#1e293b;">%d</div>
+        </td>
+      </tr>
+    </table>
+    <p style="font-size:13px;color:#64748b;margin:0 0 8px;">
+      Total device = unit tersample. <strong>Avg &gt; 3s</strong> = yang masuk distribusi delay (%s).
+    </p>
+    <p style="font-size:12px;color:#94a3b8;margin:0 0 16px;">Distribusi: %s</p>
+    %s
+    <h3 style="font-size:14px;color:#1e293b;margin:20px 0 10px;">Top 10 avg delay</h3>
+    <table width="100%%" cellpadding="0" cellspacing="0" style="border:1px solid #e2e8f0;border-radius:8px;overflow:hidden;font-size:13px;">
+      <thead>
+        <tr style="background:#f8fafc;">
+          <th style="padding:8px 12px;text-align:left;font-size:11px;color:#94a3b8;">#</th>
+          <th style="padding:8px 12px;text-align:left;font-size:11px;color:#94a3b8;">DEVICE</th>
+          <th style="padding:8px 12px;text-align:left;font-size:11px;color:#94a3b8;">DEVICE ID</th>
+          <th style="padding:8px 12px;text-align:left;font-size:11px;color:#94a3b8;">AVG DELAY</th>
+        </tr>
+      </thead>
+      <tbody>%s</tbody>
+    </table>
+    <p style="font-size:12px;color:#94a3b8;margin:16px 0 0;">
+      File Excel lampiran berisi min / max / avg semua device tersample hari tersebut.
+    </p>
+  </td></tr>
+  <tr>
+    <td style="background:#1e3a5f;padding:12px 28px;text-align:center;">
+      <p style="margin:0;font-size:11px;color:rgba(255,255,255,.5);">VSS Monitor · Automated daily report · IOH SMTP</p>
+    </td>
+  </tr>
+</table>
+</td></tr></table>
+</body></html>`,
+		sum.Date,
+		sum.Date,
+		sum.TotalDevices,
+		pieTotal,
+		formatDelayHuman(sum.MaxDelaySec),
+		sum.TotalEvents,
+		func() string {
+			if sum.MaxDelayDevice != "" {
+				return fmt.Sprintf(`<p style="font-size:13px;color:#64748b;margin:0 0 12px;">Delay tertinggi: <strong style="color:#dc2626;">%s</strong> · %s (%s)</p>`,
+					formatDelayHuman(sum.MaxDelaySec), sum.MaxDelayDevice, sum.MaxDelayDeviceID)
+			}
+			return ""
+		}(),
+		distLine,
+		topRows.String(),
+	)
 }
 
 func (s *vssMonitorService) flushAlertDigest() {

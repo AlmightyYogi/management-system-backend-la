@@ -194,3 +194,12 @@ func (h *VSSHandler) ExportDayDelayExcel(c *gin.Context) {
 		return
 	}
 }
+
+func (h *VSSHandler) SendDailyReport(c *gin.Context) {
+	date := c.Query("date")
+	if err := h.svc.SendDailyReport(date); err != nil {
+		utils.Error(c, http.StatusBadRequest, err.Error(), err)
+		return
+	}
+	utils.Success(c, "Daily report queued/sent", gin.H{"data": date})
+}
