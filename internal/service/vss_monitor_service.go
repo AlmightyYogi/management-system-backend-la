@@ -1070,11 +1070,40 @@ func (s *vssMonitorService) recordTraffic(action string) {
 }
 
 func (s *vssMonitorService) computeDelaySec(p statusPayload, now time.Time) int64 {
+	var dtuDelay int64
+	var hasDTU bool
 	if t, ok := parseDTU(p.DTU); ok {
-		return int64(now.Sub(t).Seconds())
+		dtuDelay = int64(now.Sub(t).Seconds())
+		hasDTU = true
 	}
+
+	var reportDelay int64
+	var hasReport bool
 	if t, ok := reportTimeToTime(p.Ext.ReportTime); ok {
-		return int64(now.Sub(t).Seconds())
+		reportDelay = int64(now.Sub(t).Seconds())
+		hasReport = true
+	}
+
+	const staleSkewSec int64 = 3600
+	if hasDTU && hasReport {
+		absDTU := dtuDelay
+		if absDTU < 0 {
+			absDTU = -absDTU
+		}
+		absRep := reportDelay
+		if absRep < 0 {
+			absRep = -absRep
+		}
+		if absDTU > staleSkewSec && absRep < absDTU {
+			return reportDelay
+		}
+		return dtuDelay
+	}
+	if hasDTU {
+		return dtuDelay
+	}
+	if hasReport {
+		return reportDelay
 	}
 	return 0
 }
