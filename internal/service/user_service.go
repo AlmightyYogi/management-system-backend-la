@@ -18,6 +18,7 @@ type UserService interface {
 	GetAllUsers() ([]dto.UserRequest, error)
 	UpdateUser(uuid string, req dto.UpdateUserRequest) (*domain.User, error)
 	GetUserByUUID(uuidStr string) (*domain.User, error)
+	ChangePassword(userUUID string, req dto.ChangePasswordRequest) error
 }
 
 type userService struct {
@@ -156,4 +157,33 @@ func (s *userService) UpdateUser(uuid string, req dto.UpdateUserRequest) (*domai
 		return nil, err
 	}
 	return user, nil
+}
+
+func (s *userService) ChangePassword(userUUID string, req dto.ChangePasswordRequest) error {
+	if req.NewPassword != req.ConfirmPassword {
+		return errors.New("konfirmasi password tidak cocok")
+	}
+	if len(req.NewPassword) < 6 {
+		return errors.New("password baru minimal 6 karakter")
+	}
+
+	user, err := s.userRepo.FindByUUID(userUUID)
+	if err != nil {
+		return errors.New("user not found")
+	}
+
+	if err := bcrypt.CompareHashAndPassword([]byte(user.Password), []byte(req.CurrentPassword)); err != nil {
+		return errors.New("password lama tidak sesuai")
+	}
+
+	hashed, err := bcrypt.GenerateFromPassword([]byte(req.NewPassword), bcrypt.DefaultCost)
+	if err != nil {
+		return errors.New("gagal mengenkripsi password")
+	}
+
+	user.Password = string(hashed)
+	if err := s.userRepo.Update(user); err != nil {
+		return err
+	}
+	return nil
 }

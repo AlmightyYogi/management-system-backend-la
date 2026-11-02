@@ -170,3 +170,25 @@ func (h *UserHandler) UpdateUser(c *gin.Context) {
 
 	utils.Success(c, "User updated successfully", user)
 }
+
+func (h *UserHandler) ChangePassword(c *gin.Context) {
+	var req dto.ChangePasswordRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		utils.ValidationError(c, err.Error())
+		return
+	}
+
+	uuidFromToken, _ := c.Get("user_uuid")
+	uuidStr, _ := uuidFromToken.(string)
+	if uuidStr == "" {
+		utils.Unauthorized(c, "Sesi tidak valid")
+		return
+	}
+
+	if err := h.userService.ChangePassword(uuidStr, req); err != nil {
+		utils.Error(c, http.StatusBadRequest, err.Error(), nil)
+		return
+	}
+
+	utils.Success(c, "Password berhasil diubah", nil)
+}

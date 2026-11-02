@@ -34,6 +34,8 @@ type VSSMonitorService interface {
 	GetDaySummary(date string) (*domain.VSSDaySummary, error)
 	GetDayDelayExport(date string) ([]domain.VSSDayDeviceDelayStat, error)
 	SendDailyReport(date string) error
+	GetDeviceDelayStats(deviceID, rangeKey string) (*domain.VSSDeviceDelayStats, error)
+	GetDeviceDelayHistory(deviceID, rangeKey string) ([]domain.VSSDeviceDelayPoint, error)
 }
 
 type VSSDeviceLive struct {
@@ -103,6 +105,7 @@ type vssMonitorService struct {
 	currentMinute   time.Time
 	currentCounts   map[string]int64
 	minuteHistory   []MinuteTraffic
+	recentSamples   map[string][]delaySamplePoint
 }
 
 type wsEnvelope struct {
@@ -158,6 +161,14 @@ type alarmPayload80004 struct {
 	} `json:"payload"`
 }
 
+type delaySamplePoint struct {
+	ReceivedAt time.Time
+	DTU        string
+	DelaySec   int64
+	Action     string
+	Reason     string
+}
+
 func NewVSSMonitorService(repo repository.VSSDelayRepository, historyRepo repository.VSSAlertHistoryRepository, cfg config.VSSConfig) VSSMonitorService {
 	if cfg.DelayThresholdSec <= 0 {
 		cfg.DelayThresholdSec = 60
@@ -185,6 +196,7 @@ func NewVSSMonitorService(repo repository.VSSDelayRepository, historyRepo reposi
 		trafficByAction: make(map[string]int64),
 		currentCounts:   make(map[string]int64),
 		minuteHistory:   make([]MinuteTraffic, 0, 60),
+		recentSamples:   make(map[string][]delaySamplePoint),
 	}
 
 	if cfg.EmailCooldownMin <= 0 {
@@ -362,6 +374,11 @@ func (s *vssMonitorService) ListLive(deviceName, action, status string, onlyIssu
 		}
 
 		cp := *v
+		if t, ok := parseDTU(cp.DTU); ok {
+			cp.DelaySec = int64(now.Sub(t).Seconds())
+		} else if t, ok := reportTimeToTime(cp.ReportTime); ok {
+			cp.DelaySec = int64(now.Sub(t).Seconds())
+		}
 
 		const (
 			vssOfflineAfter = 6 * time.Hour
@@ -714,7 +731,6 @@ func (s *vssMonitorService) GetDayDelayExport(date string) ([]domain.VSSDayDevic
 		})
 	}
 
-	// Sort seperti top 10: delay max tertinggi dulu, negatif paling bawah
 	sort.Slice(out, func(i, j int) bool {
 		if out[i].MaxDelaySec == out[j].MaxDelaySec {
 			return out[i].DeviceName < out[j].DeviceName
@@ -1127,6 +1143,34 @@ func (s *vssMonitorService) persistIfNotSpam(
 	}
 }
 
+const (
+	sampleLogWindow  = 30 * time.Second
+	sampleMemoryKeep = 24 * time.Hour
+	sampleMemoryMaxN = 2000
+)
+
+func (s *vssMonitorService) pushRecentSample(deviceID string, pt delaySamplePoint) {
+	if deviceID == "" {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.recentSamples == nil {
+		s.recentSamples = make(map[string][]delaySamplePoint)
+	}
+	arr := append(s.recentSamples[deviceID], pt)
+	cut := time.Now().Add(-sampleMemoryKeep)
+	i := 0
+	for i < len(arr) && arr[i].ReceivedAt.Before(cut) {
+		i++
+	}
+	arr = arr[i:]
+	if len(arr) > sampleMemoryMaxN {
+		arr = arr[len(arr)-sampleMemoryMaxN:]
+	}
+	s.recentSamples[deviceID] = arr
+}
+
 func (s *vssMonitorService) persistDelaySample(
 	p statusPayload,
 	delaySec int64,
@@ -1134,7 +1178,6 @@ func (s *vssMonitorService) persistDelaySample(
 	action string,
 ) {
 	const sampleReason = "delay_sample"
-	sampleWindow := 5 * time.Minute
 
 	abs := delaySec
 	if abs < 0 {
@@ -1144,7 +1187,15 @@ func (s *vssMonitorService) persistDelaySample(
 		return
 	}
 
-	exists, err := s.repo.ExistsRecent(p.DeviceID, sampleReason, sampleWindow)
+	s.pushRecentSample(p.DeviceID, delaySamplePoint{
+		ReceivedAt: now,
+		DTU:        p.DTU,
+		DelaySec:   delaySec,
+		Action:     action,
+		Reason:     sampleReason,
+	})
+
+	exists, err := s.repo.ExistsRecent(p.DeviceID, sampleReason, sampleLogWindow)
 	if err != nil || exists {
 		return
 	}
@@ -1159,7 +1210,7 @@ func (s *vssMonitorService) persistDelaySample(
 		"VSS | sample | action=%s | device=%s (%s) | delay=%ds | dtu=%s",
 		action, p.DeviceID, p.Ext.DeviceName, delaySec, p.DTU,
 	)
-	
+
 	ev := domain.VSSDelayEvent{
 		DetectedAt: detected,
 		DeviceID:   p.DeviceID,
@@ -1173,7 +1224,6 @@ func (s *vssMonitorService) persistDelaySample(
 		Message:    msg,
 		Action:     action,
 	}
-
 	if err := s.repo.Append(ev); err != nil {
 		log.Printf("[VSS] write delay sample error: %v", err)
 	}
@@ -1422,98 +1472,152 @@ func (s *vssMonitorService) handleAlarm80004(raw json.RawMessage) {
 	}
 }
 
-// func (s *vssMonitorService) ProcessIncoming(action string, payload map[string]interface{}) {
-// 	receivedAt := time.Now()
-// 	s.repo.IncrementCounter(action)
+func parseRangeDuration(rangeKey string) time.Duration {
+	switch strings.ToLower(strings.TrimSpace(rangeKey)) {
+	case "15m":
+		return 15 * time.Minute
+	case "3h":
+		return 3 * time.Hour
+	case "6h":
+		return 6 * time.Hour
+	case "12h":
+		return 12 * time.Hour
+	case "24h":
+		return 24 * time.Hour
+	default:
+		return time.Hour
+	}
+}
 
-// 	if action != "80003" && action != "80004" {
-// 		return
-// 	}
+func categorizeDeviceDelay(sec int64) string {
+	s := sec
+	if s < 0 {
+		s = -s
+	}
+	if s <= 5 {
+		return "0-5s"
+	}
+	if s <= 60 {
+		return "5s-1m"
+	}
+	return ">1m"
+}
 
-// 	deviceID, _   := payload["deviceID"].(string)
-// 	nodeID, _     := payload["nodeID"].(string)
-// 	dtuStr, _     := payload["dtu"].(string)
-// 	isLaterStr, _ := payload["isLater"].(string)
+func (s *vssMonitorService) samplesForDevice(deviceID string, since time.Time) []delaySamplePoint {
+	s.mu.Lock()
+	arr := s.recentSamples[deviceID]
+	out := make([]delaySamplePoint, 0, len(arr))
+	for _, p := range arr {
+		if !p.ReceivedAt.Before(since) {
+			out = append(out, p)
+		}
+	}
+	s.mu.Unlock()
+	return out
+}
 
-// 	ext, _       := payload["ext"].(map[string]interface{})
-// 	deviceName   := ""
-// 	reportTime   := int64(0)
-// 	if ext != nil {
-// 		deviceName, _ = ext["deviceName"].(string)
-// 		if rt, ok := ext["reportTime"].(float64); ok {
-// 			reportTime = int64(rt)
-// 		}
-// 	}
+func (s *vssMonitorService) GetDeviceDelayHistory(deviceID, rangeKey string) ([]domain.VSSDeviceDelayPoint, error) {
+	since := time.Now().Add(-parseRangeDuration(rangeKey))
+	mem := s.samplesForDevice(deviceID, since)
 
-// 	var dtuTime time.Time
-// 	if dtuStr != "" {
-// 		parsed, err := time.ParseInLocation("2006-01-02 15:04:05", dtuStr, jakartaTZ)
-// 		if err == nil {
-// 			dtuTime = parsed
-// 		}
-// 	}
-// 	if dtuTime.IsZero() {
-// 		dtuTime = receivedAt
-// 	}
+	if len(mem) < 5 {
+		if fileEv, err := s.repo.ListByDeviceSince(deviceID, since); err == nil {
+			seen := map[string]struct{}{}
+			for _, p := range mem {
+				seen[p.ReceivedAt.Format(time.RFC3339Nano)] = struct{}{}
+			}
+			for _, ev := range fileEv {
+				t, err := time.Parse(time.RFC3339, ev.DetectedAt)
+				if err != nil {
+					continue
+				}
+				key := t.Format(time.RFC3339Nano)
+				if _, ok := seen[key]; ok {
+					continue
+				}
+				mem = append(mem, delaySamplePoint{
+					ReceivedAt: t,
+					DTU:        ev.DTU,
+					DelaySec:   ev.DelaySec,
+					Action:     ev.Action,
+					Reason:     ev.Reason,
+				})
+			}
+			sort.Slice(mem, func (i, j int) bool {
+				return mem[i].ReceivedAt.Before(mem[j].ReceivedAt)
+			})
+		}
+	}
 
-// 	delayMs := receivedAt.UnixMilli() - dtuTime.UnixMilli()
-// 	if delayMs < 0 {
-// 		delayMs = 0
-// 	}
-// 	delaySec := delayMs / 1000
+	loc, _ := time.LoadLocation("Asia/Jakarta")
+	if loc == nil {
+		loc = time.FixedZone("WIB", 7*3600)
+	}
+	out := make([]domain.VSSDeviceDelayPoint, 0, len(mem))
+	for _, p := range mem {
+		out = append(out, domain.VSSDeviceDelayPoint{
+			ReceivedAt: p.ReceivedAt.In(loc).Format(time.RFC3339),
+			DTU:        p.DTU,
+			DelaySec:   p.DelaySec,
+			Action:     p.Action,
+			Reason:     p.Reason,
+		})
+	}
+	return out, nil
+}
 
-// 	isLater := isLaterStr == "1"
+func (s *vssMonitorService) GetDeviceDelayStats(deviceID, rangeKey string) (*domain.VSSDeviceDelayStats, error) {
+	points, err := s.GetDeviceDelayHistory(deviceID, rangeKey)
+	if err != nil {
+		return nil, err
+	}
 
-// 	status := "NORMAL"
-// 	reason := ""
-// 	if storageArr, ok := payload["storage"].([]interface{}); ok {
-// 		for _, si := range storageArr {
-// 			if sm, ok := si.(map[string]interface{}); ok {
-// 				free, _ := sm["free"].(string)
-// 				if free == "0" {
-// 					status = "STORAGE_FULL"
-// 					reason = "STORAGE_FULL"
-// 					break
-// 				}
-// 			}
-// 		}
-// 	}
+	name := deviceID
+	s.mu.Lock()
+	if n, ok := s.deviceName[deviceID]; ok && n != "" {
+		name = n
+	} else if live, ok := s.live[deviceID]; ok && live != nil && live.DeviceName != "" {
+		name = live.DeviceName
+	}
+	s.mu.Unlock()
 
-// 	message := formatDelay(delaySec)
+	cat := map[string]int{"0-5s": 0, "5s-1m": 0, ">1m": 0}
+	var sumAbs int64
+	var maxAbs int64
+	var last domain.VSSDeviceDelayPoint
 
-// 	s.repo.UpsertLive(domain.VSSLiveDevice{
-// 		DeviceID:   deviceID,
-// 		DeviceName: deviceName,
-// 		NodeID:     nodeID,
-// 		DTU:        dtuStr,
-// 		LastSeen:   receivedAt.Format("02/01/2006 15:04:05"),
-// 		DelayMs:    delayMs,
-// 		DelaySec:   delaySec,
-// 		Action:     action,
-// 		Reason:     reason,
-// 		Status:     status,
-// 		IsLater:    isLater,
-// 		ReportTime: reportTime,
-// 	})
-
-// 	if status != "NORMAL" || delaySec > 60 {
-// 		event := domain.VSSDelayEvent{
-// 			DetectedAt: receivedAt.Format(time.RFC3339),
-// 			DeviceID:   deviceID,
-// 			DeviceName: deviceName,
-// 			NodeID:     nodeID,
-// 			DTU:        dtuStr,
-// 			ReportTime: reportTime,
-// 			IsLater:    isLater,
-// 			DelayMs:    delayMs,
-// 			DelaySec:   delaySec,
-// 			Reason:     reason,
-// 			Message:    message,
-// 			Action:     action,
-// 		}
-// 		_ = s.repo.Append(event)
-// 	}
-// }
+	for i, p := range points {
+		abs := p.DelaySec
+		if abs < 0 {
+			abs = -abs
+		}
+		cat[categorizeDeviceDelay(p.DelaySec)]++
+		sumAbs += abs
+		if abs > maxAbs {
+			maxAbs = abs
+		}
+		last = p
+		_ = i
+	}
+	st := &domain.VSSDeviceDelayStats{
+		DeviceID:   deviceID,
+		DeviceName: name,
+		Range:      rangeKey,
+		TotalCount: len(points),
+		Categories: []domain.VSSDeviceDelayCategory{
+			{Category: "0-5s", Count: cat["0-5s"]},
+			{Category: "5s-1m", Count: cat["5s-1m"]},
+			{Category: ">1m", Count: cat[">1m"]},
+		},
+	}
+	if len(points) > 0 {
+		st.MaxDelaySec = maxAbs
+		st.AvgDelaySec = float64(sumAbs) / float64(len(points))
+		st.LastDelaySec = last.DelaySec
+		st.LastReceivedAt = last.ReceivedAt
+	}
+	return st, nil
+}
 
 func formatDelay(sec int64) string {
 	if sec < 60 {

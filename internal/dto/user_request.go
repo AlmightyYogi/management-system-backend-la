@@ -22,3 +22,9 @@ type UpdateUserRequest struct {
 	Active   *bool   `form:"active" json:"active"`
 	Password string  `form:"password" json:"password,omitempty"`
 }
+
+type ChangePasswordRequest struct {
+	CurrentPassword	string	`json:"current_password" binding:"required"`
+	NewPassword		string	`json:"new_password" binding:"required,min=6"`
+	ConfirmPassword	string	`json:"confirm_password" binding:"required"`
+}

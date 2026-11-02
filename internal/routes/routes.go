@@ -32,6 +32,7 @@ func SetupRoutes(r *gin.Engine, reportHandler *handler.ReportHandler, userHandle
 		accounts.GET("/", userHandler.GetAllUsers)
 		accounts.GET("/:uuid", userHandler.GetUserByUUID)
 		accounts.PUT("/:uuid", userHandler.UpdateUser)
+		accounts.POST("/change-password", userHandler.ChangePassword)
 	}
 
 	reports := nonGuest.Group("/reports")
@@ -81,6 +82,8 @@ func SetupRoutes(r *gin.Engine, reportHandler *handler.ReportHandler, userHandle
 		vss.GET("/summary", vssHandler.GetDaySummary)
 		vss.GET("/summary/export", vssHandler.ExportDayDelayExcel)
 		vss.GET("/report/send", vssHandler.SendDailyReport)
+		vss.GET("/devices/:id/stats", vssHandler.GetDeviceDelayStats)
+		vss.GET("/devices/:id/history", vssHandler.GetDeviceDelayHistory)
 	}
 
 	r.GET("/health", func(c *gin.Context) {

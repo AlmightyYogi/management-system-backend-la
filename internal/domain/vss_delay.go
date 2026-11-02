@@ -79,3 +79,28 @@ type VSSDayDeviceDelayStat struct {
 	AvgDelaySec float64 `json:"avg_delay_sec"`
 	EventCount  int    `json:"event_count"`
 }
+
+type VSSDeviceDelayPoint struct {
+	ReceivedAt string `json:"received_at"`
+	DTU        string `json:"dtu"`
+	DelaySec   int64  `json:"delay_sec"`
+	Action     string `json:"action,omitempty"`
+	Reason     string `json:"reason,omitempty"`
+}
+
+type VSSDeviceDelayCategory struct {
+	Category string `json:"category"`
+	Count    int    `json:"count"`
+}
+
+type VSSDeviceDelayStats struct {
+	DeviceID       string                   `json:"device_id"`
+	DeviceName     string                   `json:"device_name"`
+	Range          string                   `json:"range"`
+	TotalCount     int                      `json:"total_count"`
+	MaxDelaySec    int64                    `json:"max_delay_sec"`
+	AvgDelaySec    float64                  `json:"avg_delay_sec"`
+	LastDelaySec   int64                    `json:"last_delay_sec"`
+	LastReceivedAt string                   `json:"last_received_at"`
+	Categories     []VSSDeviceDelayCategory `json:"categories"`
+}

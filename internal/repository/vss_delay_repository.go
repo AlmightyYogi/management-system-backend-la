@@ -33,6 +33,7 @@ type VSSDelayRepository interface {
 	IncrementCounter(action string)
 
 	ListAllByDate(date string) ([]domain.VSSDelayEvent, error)
+	ListByDeviceSince(deviceID string, since time.Time) ([]domain.VSSDelayEvent, error)
 }
 
 type VSSLiveFilter struct {
@@ -326,5 +327,62 @@ func (r *vssDelayRepository) ListAllByDate(date string) ([]domain.VSSDelayEvent,
 	if err := sc.Err(); err != nil {
 		return nil, err
 	}
+	return all, nil
+}
+
+func (r *vssDelayRepository) ListByDeviceSince(deviceID string, since time.Time) ([]domain.VSSDelayEvent, error) {
+	if strings.TrimSpace(deviceID) == "" {
+		return nil, fmt.Errorf("device_id required")
+	}
+	loc, _ := time.LoadLocation("Asia/Jakarta")
+	if loc == nil {
+		loc = time.FixedZone("WIB", 7*3600)
+	}
+	now := time.Now().In(loc)
+	since = since.In(loc)
+
+	var all []domain.VSSDelayEvent
+	for d := time.Date(since.Year(), since.Month(), since.Day(), 0, 0, 0, 0, loc); !d.After(now); d = d.AddDate(0, 0, 1) {
+		path := r.filePath(d)
+		f, err := os.Open(path)
+		if err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			return nil, err
+		}
+		sc := bufio.NewScanner(f)
+		buf := make([]byte, 0, 64*1024)
+		sc.Buffer(buf, 1024*1024)
+		for sc.Scan() {
+			line := strings.TrimSpace(sc.Text())
+			if line == "" {
+				continue
+			}
+			var ev domain.VSSDelayEvent
+			if err := json.Unmarshal([]byte(line), &ev); err != nil {
+				continue
+			}
+			if ev.DeviceID != deviceID || ev.DeviceID == "" || ev.DeviceID == "SYSTEM" {
+				continue
+			}
+			t, err := time.Parse(time.RFC3339, ev.DetectedAt)
+			if err != nil {
+				continue
+			}
+			if t.Before(since) {
+				continue
+			}
+			all = append(all, ev)
+		}
+		_ = f.Close()
+		if err := sc.Err(); err != nil {
+			return nil, err
+		}
+	}
+
+	sort.Slice(all, func(i, j int) bool {
+		return all[i].DetectedAt < all[j].DetectedAt
+	})
 	return all, nil
 }

@@ -203,3 +203,30 @@ func (h *VSSHandler) SendDailyReport(c *gin.Context) {
 	}
 	utils.Success(c, "Daily report queued/sent", gin.H{"data": date})
 }
+
+func (h *VSSHandler) GetDeviceDelayStats(c *gin.Context) {
+	id := strings.TrimSpace(c.Param("id"))
+	if id == "" {
+		utils.Error(c, http.StatusBadRequest, "device id required", nil)
+		return
+	}
+	res, err := h.svc.GetDeviceDelayStats(id, c.DefaultQuery("range", "1h"))
+	if err != nil {
+		utils.Error(c, http.StatusInternalServerError, err.Error(), err)
+		return
+	}
+	utils.Success(c, "OK", res)
+}
+
+func (h *VSSHandler) GetDeviceDelayHistory(c *gin.Context) {
+	id := strings.TrimSpace(c.Param("id"))
+	if id == "" {
+		utils.Error(c, http.StatusBadRequest, "device id required", nil)
+	}
+	res, err := h.svc.GetDeviceDelayHistory(id, c.DefaultQuery("range", "1h"))
+	if err != nil {
+		utils.Error(c, http.StatusInternalServerError, err.Error(), err)
+		return
+	}
+	utils.Success(c, "OK", res)
+}
