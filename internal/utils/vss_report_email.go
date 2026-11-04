@@ -14,7 +14,7 @@ import (
 	"github.com/AlmightyOggy/management-system/internal/config"
 )
 
-func SendVSSReportEmail(to []string, subject, htmlBody string, attachments map[string][]byte) error {
+func SendVSSReportEmail(to, cc []string, subject, htmlBody string, attachments map[string][]byte) error {
 	cfg := config.GetConfig()
 	r := cfg.VSSReportEmail
 
@@ -84,6 +84,9 @@ func SendVSSReportEmail(to []string, subject, htmlBody string, attachments map[s
 	var msg bytes.Buffer
 	msg.WriteString(fmt.Sprintf("From: %s\r\n", fromHeader))
 	msg.WriteString(fmt.Sprintf("To: %s\r\n", strings.Join(to, ", ")))
+	if len(cc) > 0 {
+		msg.WriteString(fmt.Sprintf("Cc: %s\r\n", strings.Join(cc, ", ")))
+	}
 	msg.WriteString(fmt.Sprintf("Subject: %s\r\n", subject))
 	msg.WriteString("MIME-Version: 1.0\r\n")
 	msg.WriteString(fmt.Sprintf("Content-Type: multipart/mixed; boundary=%s\r\n", boundary))
@@ -116,11 +119,21 @@ func SendVSSReportEmail(to []string, subject, htmlBody string, attachments map[s
 	if err := c.Mail(from); err != nil {
 		return fmt.Errorf("mail from: %w", err)
 	}
-	for _, rcpt := range to {
+	recipients := make([]string, 0, len(to)+len(cc))
+	recipients = append(recipients, to...)
+	recipients = append(recipients, cc...)
+
+	seen := make(map[string]struct{}, len(recipients))
+	for _, rcpt := range recipients {
 		rcpt = strings.TrimSpace(rcpt)
 		if rcpt == "" {
 			continue
 		}
+		key := strings.ToLower(rcpt)
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
 		if err := c.Rcpt(rcpt); err != nil {
 			return fmt.Errorf("rcpt %s: %w", rcpt, err)
 		}

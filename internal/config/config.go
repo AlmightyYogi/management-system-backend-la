@@ -72,6 +72,7 @@ type VSSReportEmailConfig struct {
 	FromEmail     string
 	FromName      string
 	ToEmails      string
+	CcEmails	  string
 	Hour          int
 	Minute        int
 }

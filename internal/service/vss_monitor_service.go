@@ -1979,9 +1979,10 @@ func (s *vssMonitorService) SendDailyReport(date string) error {
 	if len(to) == 0 {
 		return fmt.Errorf("no recipients in VSS_REPORT_TO_EMAILS")
 	}
+	cc := utils.ParseEmailList(r.CcEmails)
 
 	filename := fmt.Sprintf("vss-rekap-delay-%s.xlsx", date)
-	return utils.SendVSSReportEmail(to, subject, html, map[string][]byte{
+	return utils.SendVSSReportEmail(to, cc, subject, html, map[string][]byte{
 		filename: xlsxBytes,
 	})
 }
@@ -2103,113 +2104,214 @@ func buildVSSDailyReportHTML(sum *domain.VSSDaySummary) string {
 		if i >= 10 {
 			break
 		}
+		bg := "#ffffff"
+		if i%2 == 1 {
+			bg = "#f8fafc"
+		}
 		topRows.WriteString(fmt.Sprintf(`
-			<tr>
-				<td style="padding:8px 12px;border-bottom:1px solid #f1f5f9;">%d</td>
-				<td style="padding:8px 12px;border-bottom:1px solid #f1f5f9;font-weight:600;">%s</td>
-				<td style="padding:8px 12px;border-bottom:1px solid #f1f5f9;font-family:monospace;font-size:12px;">%s</td>
-				<td style="padding:8px 12px;border-bottom:1px solid #f1f5f9;color:#dc2626;font-weight:700;">%s</td>
+			<tr style="background:%s;">
+				<td style="padding:10px 12px;border-bottom:1px solid #e2e8f0;color:#64748b;font-size:13px;">%d</td>
+				<td style="padding:10px 12px;border-bottom:1px solid #e2e8f0;font-weight:600;color:#0f172a;font-size:13px;">%s</td>
+				<td style="padding:10px 12px;border-bottom:1px solid #e2e8f0;font-family:Consolas,monospace;font-size:12px;color:#64748b;">%s</td>
+				<td style="padding:10px 12px;border-bottom:1px solid #e2e8f0;color:#dc2626;font-weight:700;font-size:13px;text-align:right;">%s</td>
 			</tr>`,
-			i+1, d.DeviceName, d.DeviceID, formatDelayHuman(d.MaxDelaySec),
+			bg,
+			i+1,
+			htmlEscape(d.DeviceName),
+			htmlEscape(d.DeviceID),
+			formatDelayHuman(d.MaxDelaySec),
 		))
 	}
 	if topRows.Len() == 0 {
-		topRows.WriteString(`<tr><td colspan="4" style="padding:16px;text-align:center;color:#94a3b8;">Tidak ada device avg delay &gt; 3 detik</td></tr>`)
+		topRows.WriteString(`
+			<tr>
+				<td colspan="4" style="padding:20px;text-align:center;color:#94a3b8;font-size:13px;">
+					Tidak ada device dengan avg delay &gt; 3 detik
+				</td>
+			</tr>`)
 	}
 
-	distLine := ""
-	if sum.Distribution != nil {
-		distLine = fmt.Sprintf(
-			"3–5s: %d · 5s–1m: %d · 1–5m: %d · &gt;5m: %d",
-			sum.Distribution["1s-5s"],
-			sum.Distribution["5s-1m"],
-			sum.Distribution["1m-5m"],
-			sum.Distribution[">5m"],
+	maxDeviceBlock := ""
+	if sum.MaxDelayDevice != "" {
+		maxDeviceBlock = fmt.Sprintf(`
+			<div style="margin:0 0 16px;padding:12px 14px;background:#fef2f2;border:1px solid #fecaca;border-radius:8px;font-size:13px;color:#7f1d1d;">
+				<span style="font-weight:600;">Delay tertinggi:</span>
+				<span style="color:#dc2626;font-weight:700;">%s</span>
+				&nbsp;·&nbsp;%s
+				<span style="color:#94a3b8;font-family:Consolas,monospace;font-size:12px;">(%s)</span>
+			</div>`,
+			formatDelayHuman(sum.MaxDelaySec),
+			htmlEscape(sum.MaxDelayDevice),
+			htmlEscape(sum.MaxDelayDeviceID),
 		)
 	}
 
+	d15 := 0
+	d51 := 0
+	d15m := 0
+	d5m := 0
+	if sum.Distribution != nil {
+		d15 = sum.Distribution["1s-5s"]
+		d51 = sum.Distribution["5s-1m"]
+		d15m = sum.Distribution["1m-5m"]
+		d5m = sum.Distribution[">5m"]
+	}
+
 	return fmt.Sprintf(`<!DOCTYPE html>
-<html lang="id"><head><meta charset="UTF-8"><title>VSS Rekap %s</title></head>
-<body style="margin:0;padding:0;background:#f3f4f6;font-family:'Segoe UI',Arial,sans-serif;">
-<table width="100%%" cellpadding="0" cellspacing="0" style="background:#f3f4f6;padding:24px 0;">
-<tr><td align="center">
-<table width="640" style="max-width:640px;width:100%%;background:#fff;border-radius:12px;overflow:hidden;box-shadow:0 4px 20px rgba(0,0,0,.08);">
-  <tr>
-    <td style="background:linear-gradient(135deg,#1e3a5f,#2563eb);padding:24px 28px;text-align:center;">
-      <div style="color:#fff;font-size:13px;opacity:.85;margin-bottom:6px;">VSS Monitor · Laporan Harian</div>
-      <h1 style="color:#fff;margin:0;font-size:20px;">Rekap Delay %s</h1>
-      <p style="color:rgba(255,255,255,.8);margin:8px 0 0;font-size:13px;">00:00 – 23:59 WIB · dikirim otomatis</p>
-    </td>
-  </tr>
-  <tr><td style="padding:24px 28px;">
-    <table width="100%%" cellpadding="0" cellspacing="0" style="margin-bottom:20px;">
-      <tr>
-        <td style="width:25%%;padding:10px;background:#f8fafc;border:1px solid #e2e8f0;border-radius:8px;text-align:center;">
-          <div style="font-size:11px;color:#94a3b8;text-transform:uppercase;">Total device</div>
-          <div style="font-size:22px;font-weight:700;color:#1e293b;">%d</div>
-        </td>
-        <td style="width:8px;"></td>
-        <td style="width:25%%;padding:10px;background:#f8fafc;border:1px solid #e2e8f0;border-radius:8px;text-align:center;">
-          <div style="font-size:11px;color:#94a3b8;text-transform:uppercase;">Avg &gt; 3s</div>
-          <div style="font-size:22px;font-weight:700;color:#1e293b;">%d</div>
-        </td>
-        <td style="width:8px;"></td>
-        <td style="width:25%%;padding:10px;background:#f8fafc;border:1px solid #e2e8f0;border-radius:8px;text-align:center;">
-          <div style="font-size:11px;color:#94a3b8;text-transform:uppercase;">Delay tertinggi</div>
-          <div style="font-size:18px;font-weight:700;color:#dc2626;">%s</div>
-        </td>
-        <td style="width:8px;"></td>
-        <td style="width:25%%;padding:10px;background:#f8fafc;border:1px solid #e2e8f0;border-radius:8px;text-align:center;">
-          <div style="font-size:11px;color:#94a3b8;text-transform:uppercase;">Total event</div>
-          <div style="font-size:22px;font-weight:700;color:#1e293b;">%d</div>
-        </td>
-      </tr>
-    </table>
-    <p style="font-size:13px;color:#64748b;margin:0 0 8px;">
-      Total device = unit tersample. <strong>Avg &gt; 3s</strong> = yang masuk distribusi delay (%s).
-    </p>
-    <p style="font-size:12px;color:#94a3b8;margin:0 0 16px;">Distribusi: %s</p>
-    %s
-    <h3 style="font-size:14px;color:#1e293b;margin:20px 0 10px;">Top 10 avg delay</h3>
-    <table width="100%%" cellpadding="0" cellspacing="0" style="border:1px solid #e2e8f0;border-radius:8px;overflow:hidden;font-size:13px;">
-      <thead>
-        <tr style="background:#f8fafc;">
-          <th style="padding:8px 12px;text-align:left;font-size:11px;color:#94a3b8;">#</th>
-          <th style="padding:8px 12px;text-align:left;font-size:11px;color:#94a3b8;">DEVICE</th>
-          <th style="padding:8px 12px;text-align:left;font-size:11px;color:#94a3b8;">DEVICE ID</th>
-          <th style="padding:8px 12px;text-align:left;font-size:11px;color:#94a3b8;">AVG DELAY</th>
-        </tr>
-      </thead>
-      <tbody>%s</tbody>
-    </table>
-    <p style="font-size:12px;color:#94a3b8;margin:16px 0 0;">
-      File Excel lampiran berisi min / max / avg semua device tersample hari tersebut.
-    </p>
-  </td></tr>
-  <tr>
-    <td style="background:#1e3a5f;padding:12px 28px;text-align:center;">
-      <p style="margin:0;font-size:11px;color:rgba(255,255,255,.5);">VSS Monitor · Automated daily report · IOH SMTP</p>
-    </td>
-  </tr>
-</table>
-</td></tr></table>
-</body></html>`,
-		sum.Date,
-		sum.Date,
-		sum.TotalDevices,
-		pieTotal,
-		formatDelayHuman(sum.MaxDelaySec),
-		sum.TotalEvents,
-		func() string {
-			if sum.MaxDelayDevice != "" {
-				return fmt.Sprintf(`<p style="font-size:13px;color:#64748b;margin:0 0 12px;">Delay tertinggi: <strong style="color:#dc2626;">%s</strong> · %s (%s)</p>`,
-					formatDelayHuman(sum.MaxDelaySec), sum.MaxDelayDevice, sum.MaxDelayDeviceID)
-			}
-			return ""
-		}(),
-		distLine,
-		topRows.String(),
+<html lang="id">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>VSS Rekap %s</title>
+</head>
+<body style="margin:0;padding:0;background:#eef2f7;font-family:'Segoe UI',Tahoma,Arial,sans-serif;-webkit-font-smoothing:antialiased;">
+  <table role="presentation" width="100%%" cellpadding="0" cellspacing="0" style="background:#eef2f7;padding:24px 12px;">
+    <tr>
+      <td align="center">
+        <table role="presentation" width="640" cellpadding="0" cellspacing="0" style="max-width:640px;width:100%%;background:#ffffff;border-radius:12px;overflow:hidden;border:1px solid #e2e8f0;">
+
+          <!-- Header -->
+          <tr>
+            <td style="background:#1e3a5f;padding:28px 28px 24px;text-align:center;">
+              <div style="color:#93c5fd;font-size:12px;letter-spacing:0.6px;text-transform:uppercase;margin-bottom:8px;">
+                VSS Monitor · Laporan Harian
+              </div>
+              <h1 style="margin:0;color:#ffffff;font-size:22px;font-weight:700;line-height:1.3;">
+                Rekap Delay %s
+              </h1>
+              <p style="margin:10px 0 0;color:#bfdbfe;font-size:13px;">
+                Periode 00:00 – 23:59 WIB · dikirim otomatis
+              </p>
+            </td>
+          </tr>
+
+          <!-- Body -->
+          <tr>
+            <td style="padding:24px 28px 8px;">
+
+              <!-- KPI -->
+              <table role="presentation" width="100%%" cellpadding="0" cellspacing="0" style="margin-bottom:20px;">
+                <tr>
+                  <td width="25%%" style="padding:4px;">
+                    <div style="background:#f8fafc;border:1px solid #e2e8f0;border-radius:10px;padding:14px 10px;text-align:center;">
+                      <div style="font-size:10px;font-weight:600;color:#94a3b8;text-transform:uppercase;letter-spacing:0.4px;">Total device</div>
+                      <div style="margin-top:6px;font-size:22px;font-weight:700;color:#0f172a;">%d</div>
+                    </div>
+                  </td>
+                  <td width="25%%" style="padding:4px;">
+                    <div style="background:#f8fafc;border:1px solid #e2e8f0;border-radius:10px;padding:14px 10px;text-align:center;">
+                      <div style="font-size:10px;font-weight:600;color:#94a3b8;text-transform:uppercase;letter-spacing:0.4px;">Avg &gt; 3s</div>
+                      <div style="margin-top:6px;font-size:22px;font-weight:700;color:#0f172a;">%d</div>
+                    </div>
+                  </td>
+                  <td width="25%%" style="padding:4px;">
+                    <div style="background:#fef2f2;border:1px solid #fecaca;border-radius:10px;padding:14px 10px;text-align:center;">
+                      <div style="font-size:10px;font-weight:600;color:#f87171;text-transform:uppercase;letter-spacing:0.4px;">Delay tertinggi</div>
+                      <div style="margin-top:6px;font-size:18px;font-weight:700;color:#dc2626;">%s</div>
+                    </div>
+                  </td>
+                  <td width="25%%" style="padding:4px;">
+                    <div style="background:#f8fafc;border:1px solid #e2e8f0;border-radius:10px;padding:14px 10px;text-align:center;">
+                      <div style="font-size:10px;font-weight:600;color:#94a3b8;text-transform:uppercase;letter-spacing:0.4px;">Total event</div>
+                      <div style="margin-top:6px;font-size:22px;font-weight:700;color:#0f172a;">%d</div>
+                    </div>
+                  </td>
+                </tr>
+              </table>
+
+              <p style="margin:0 0 12px;font-size:13px;line-height:1.55;color:#64748b;">
+                <strong style="color:#334155;">Total device</strong> = unit yang tersample hari itu.
+                <strong style="color:#334155;">Avg &gt; 3s</strong> = device yang masuk distribusi delay (%d unit).
+              </p>
+
+              %s
+
+              <!-- Distribusi -->
+              <div style="margin:0 0 20px;padding:14px 16px;background:#f8fafc;border:1px solid #e2e8f0;border-radius:10px;">
+                <div style="font-size:11px;font-weight:600;color:#94a3b8;text-transform:uppercase;letter-spacing:0.4px;margin-bottom:10px;">
+                  Distribusi avg delay
+                </div>
+                <table role="presentation" width="100%%" cellpadding="0" cellspacing="0">
+                  <tr>
+                    <td style="padding:6px 0;font-size:13px;color:#475569;">3–5 detik</td>
+                    <td style="padding:6px 0;font-size:13px;font-weight:700;color:#0f172a;text-align:right;">%d</td>
+                  </tr>
+                  <tr>
+                    <td style="padding:6px 0;font-size:13px;color:#475569;">5 detik – 1 menit</td>
+                    <td style="padding:6px 0;font-size:13px;font-weight:700;color:#0f172a;text-align:right;">%d</td>
+                  </tr>
+                  <tr>
+                    <td style="padding:6px 0;font-size:13px;color:#475569;">1 – 5 menit</td>
+                    <td style="padding:6px 0;font-size:13px;font-weight:700;color:#0f172a;text-align:right;">%d</td>
+                  </tr>
+                  <tr>
+                    <td style="padding:6px 0;font-size:13px;color:#475569;">&gt; 5 menit</td>
+                    <td style="padding:6px 0;font-size:13px;font-weight:700;color:#dc2626;text-align:right;">%d</td>
+                  </tr>
+                </table>
+              </div>
+
+              <!-- Top 10 -->
+              <div style="font-size:14px;font-weight:700;color:#0f172a;margin:0 0 10px;">
+                Top 10 avg delay
+              </div>
+              <table role="presentation" width="100%%" cellpadding="0" cellspacing="0" style="border:1px solid #e2e8f0;border-radius:10px;overflow:hidden;border-collapse:separate;">
+                <thead>
+                  <tr style="background:#f1f5f9;">
+                    <th align="left" style="padding:10px 12px;font-size:11px;color:#94a3b8;font-weight:600;text-transform:uppercase;">#</th>
+                    <th align="left" style="padding:10px 12px;font-size:11px;color:#94a3b8;font-weight:600;text-transform:uppercase;">Device</th>
+                    <th align="left" style="padding:10px 12px;font-size:11px;color:#94a3b8;font-weight:600;text-transform:uppercase;">Device ID</th>
+                    <th align="right" style="padding:10px 12px;font-size:11px;color:#94a3b8;font-weight:600;text-transform:uppercase;">Avg delay</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  %s
+                </tbody>
+              </table>
+
+              <p style="margin:16px 0 8px;font-size:12px;line-height:1.5;color:#94a3b8;">
+                Lampiran Excel berisi min / max / avg semua device yang tersample pada tanggal tersebut.
+              </p>
+            </td>
+          </tr>
+
+          <!-- Footer -->
+          <tr>
+            <td style="background:#0f172a;padding:14px 28px;text-align:center;">
+              <p style="margin:0;font-size:11px;color:#94a3b8;">
+                VSS Monitor · Automated daily report
+              </p>
+            </td>
+          </tr>
+
+        </table>
+      </td>
+    </tr>
+  </table>
+</body>
+</html>`,
+		sum.Date,                       // <title>
+		sum.Date,                       // heading
+		sum.TotalDevices,               // KPI total device
+		pieTotal,                       // KPI avg > 3s
+		formatDelayHuman(sum.MaxDelaySec), // KPI delay tertinggi
+		sum.TotalEvents,                // KPI total event
+		pieTotal,                       // teks penjelasan (%d unit)
+		maxDeviceBlock,                 // blok delay tertinggi (HTML utuh)
+		d15,                            // distribusi 3–5s
+		d51,                            // 5s–1m
+		d15m,                           // 1–5m
+		d5m,                            // >5m
+		topRows.String(),               // top 10 rows
 	)
+}
+
+func htmlEscape(s string) string {
+	s = strings.ReplaceAll(s, "&", "&amp;")
+	s = strings.ReplaceAll(s, "<", "&lt;")
+	s = strings.ReplaceAll(s, ">", "&gt;")
+	s = strings.ReplaceAll(s, `"`, "&quot;")
+	return s
 }
 
 func (s *vssMonitorService) flushAlertDigest() {
