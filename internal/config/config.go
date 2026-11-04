@@ -168,6 +168,7 @@ func LoadConfig() {
 			FromEmail:    viper.GetString("VSS_REPORT_FROM_EMAIL"),
 			FromName:     viper.GetString("VSS_REPORT_FROM_NAME"),
 			ToEmails:     viper.GetString("VSS_REPORT_TO_EMAILS"),
+			CcEmails:     viper.GetString("VSS_REPORT_CC_EMAILS"),
 			Hour:         viper.GetInt("VSS_REPORT_HOUR"),
 			Minute:       viper.GetInt("VSS_REPORT_MINUTE"),
 		},
