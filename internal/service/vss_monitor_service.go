@@ -106,11 +106,24 @@ type vssMonitorService struct {
 	currentCounts   map[string]int64
 	minuteHistory   []MinuteTraffic
 	recentSamples   map[string][]delaySamplePoint
+	liveDirty      bool
+	snapshotPath   string
+	sampleCh chan domain.VSSDelayEvent
+	eventCh  chan domain.VSSDelayEvent
 }
 
 type wsEnvelope struct {
 	Action  string          `json:"action"`
 	Payload json.RawMessage `json:"payload"`
+}
+
+type liveSnapshotFile struct {
+	SavedAt string                    `json:"saved_at"`
+	Devices []VSSDeviceLive           `json:"devices"`
+	LastSeen map[string]string        `json:"last_seen"`
+	LastDTU  map[string]string        `json:"last_dtu"`
+	LastReportMs map[string]int64     `json:"last_report_ms"`
+	DeviceName map[string]string      `json:"device_name"`
 }
 
 type statusPayload struct {
@@ -197,6 +210,8 @@ func NewVSSMonitorService(repo repository.VSSDelayRepository, historyRepo reposi
 		currentCounts:   make(map[string]int64),
 		minuteHistory:   make([]MinuteTraffic, 0, 60),
 		recentSamples:   make(map[string][]delaySamplePoint),
+		sampleCh:        make(chan domain.VSSDelayEvent, 10000),
+		eventCh:         make(chan domain.VSSDelayEvent, 5000),
 	}
 
 	if cfg.EmailCooldownMin <= 0 {
@@ -205,6 +220,13 @@ func NewVSSMonitorService(repo repository.VSSDelayRepository, historyRepo reposi
 	}
 	svc.emailReasons = parseReasonSet(cfg.EmailReasons)
 	svc.lastEmail = make(map[string]time.Time)
+
+	logDir := strings.TrimSpace(cfg.LogDir)
+	if logDir == "" {
+		logDir = "storage/public/logs/vss"
+	}
+	_ = os.MkdirAll(logDir, 0o755)
+	svc.snapshotPath = filepath.Join(logDir, "vss-live-snapshot.json")
 
 	log.Printf("[VSS] log reasons allowed: %v", keysOf(svc.logReasons))
 	return svc
@@ -263,11 +285,17 @@ func (s *vssMonitorService) Start(ctx context.Context) {
 		now.UTC().Format(time.RFC3339),
 		now.In(jakartaTZ).Format(time.RFC3339),
 	)
+
+	s.loadLiveSnapshot()
+
 	go s.loop(ctx)
 	go s.staleChecker(ctx)
+	go s.snapshotLoop(ctx)
 	go s.logCleanup(ctx)
 	go s.emailDigestLoop(ctx)
 	go s.dailyReportLoop(ctx)
+	go s.sampleWriterLoop(ctx)
+	go s.eventWriterLoop(ctx)
 	log.Println("[VSS] monitor started")
 }
 
@@ -374,27 +402,33 @@ func (s *vssMonitorService) ListLive(deviceName, action, status string, onlyIssu
 		}
 
 		cp := *v
-		if t, ok := parseDTU(cp.DTU); ok {
-			cp.DelaySec = int64(now.Sub(t).Seconds())
-		} else if t, ok := reportTimeToTime(cp.ReportTime); ok {
-			cp.DelaySec = int64(now.Sub(t).Seconds())
+
+		var seenAge time.Duration
+		if ls, ok := s.lastSeen[cp.DeviceID]; ok && !ls.IsZero() {
+			cp.LastSeen = ls.UTC().Format(time.RFC3339)
+			seenAge = now.Sub(ls)
+		} else if cp.LastSeen != "" {
+			if t, err := time.Parse(time.RFC3339, cp.LastSeen); err == nil {
+				seenAge = now.Sub(t)
+			}
 		}
 
 		const (
-			vssOfflineAfter = 6 * time.Hour
+			onlineWithin  = 120 * time.Second
+			offlineAfter  = 6 * time.Hour
 		)
-		offline := false
-		if cp.LastSeen != "" {
-			if t, err := time.Parse(time.RFC3339, cp.LastSeen); err == nil {
-				if now.Sub(t) >= vssOfflineAfter {
-					offline = true
-					cp.Status = "OFFLINE"
-				}
+
+		switch {
+		case seenAge >= offlineAfter:
+			cp.Status = "OFFLINE"
+		case seenAge >= onlineWithin:
+			cp.Status = "STALE"
+			if cp.Action == "" || cp.Action == "80003" || cp.Action == "80004" {
+				cp.Action = "stale"
 			}
-		}
-		if !offline {
-			if len(cp.Reasons) == 0 && cp.DelaySec >= int64(s.cfg.DelayThresholdSec) {
-				cp.Status = "DELAYED"
+		default:
+			if len(cp.Reasons) == 0 {
+				cp.Status = "NORMAL"
 			}
 		}
 
@@ -800,6 +834,12 @@ func (s *vssMonitorService) connectAndListen(ctx context.Context) error {
 	}
 	defer conn.Close()
 
+	_ = conn.SetReadDeadline(time.Now().Add(120 * time.Second))
+	conn.SetPongHandler(func(string) error {
+		_ = conn.SetReadDeadline(time.Now().Add(120 * time.Second))
+		return nil
+	})
+
 	loginMsg := map[string]interface{}{
 		"action": "80000",
 		"payload": map[string]string{
@@ -811,13 +851,42 @@ func (s *vssMonitorService) connectAndListen(ctx context.Context) error {
 	if err := conn.WriteJSON(loginMsg); err != nil {
 		return fmt.Errorf("ws login write: %w", err)
 	}
+	log.Printf("[VSS] websocket connected & logged in (pid=%s)", pid)
 
-	log.Println("[VSS] websocket connected & logged in")
+	pingErr := make(chan error, 1)
+	go func() {
+		ticker := time.NewTicker(15 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				_ = conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+				if err := conn.WriteMessage(websocket.PingMessage, []byte("ping")); err != nil {
+					select {
+					case pingErr <- err:
+					default:
+					}
+					return
+				}
+			}
+		}
+	}()
+
+	var (
+		msgCount   int64
+		lastLog    = time.Now()
+		lastDataAt = time.Now()
+	)
+	const dataSilence = 90 * time.Second
 
 	for {
 		select {
 		case <-ctx.Done():
 			return nil
+		case err := <-pingErr:
+			return fmt.Errorf("ws ping: %w", err)
 		default:
 		}
 
@@ -826,7 +895,33 @@ func (s *vssMonitorService) connectAndListen(ctx context.Context) error {
 		if err != nil {
 			return fmt.Errorf("ws read: %w", err)
 		}
+
+		var env struct {
+			Action string `json:"action"`
+		}
+		if json.Unmarshal(data, &env) == nil {
+			switch env.Action {
+			case "80003", "80004":
+				lastDataAt = time.Now()
+			}
+		}
+
 		s.handleMessage(data)
+		msgCount++
+
+		if time.Since(lastDataAt) > dataSilence {
+			return fmt.Errorf("ws data silence: no 80003/80004 for %s", dataSilence)
+		}
+
+		if time.Since(lastLog) >= 30*time.Second {
+			s.mu.Lock()
+			nLive := len(s.live)
+			total := s.trafficTotal
+			s.mu.Unlock()
+			log.Printf("[VSS] stream alive msgs_session=%d traffic_total=%d live_devices=%d data_age=%s",
+				msgCount, total, nLive, time.Since(lastDataAt).Round(time.Second))
+			lastLog = time.Now()
+		}
 	}
 }
 
@@ -893,15 +988,164 @@ func (s *vssMonitorService) handleMessage(data []byte) {
 
 	s.recordTraffic(env.Action)
 
-	if updated := s.tryUpsertFromAny(env.Action, env.Payload); updated {
-		return
-	}
-
 	switch env.Action {
 	case "80003":
+		if s.ingest80003(env.Payload) {
+			return
+		}
 		s.handleStatus80003(env.Payload)
 	case "80004":
+		if s.tryUpsertFromAny(env.Action, env.Payload) {
+			return
+		}
 		s.handleAlarm80004(env.Payload)
+	default:
+		_ = s.tryUpsertFromAny(env.Action, env.Payload)
+	}
+}
+
+func (s *vssMonitorService) ingest80003(raw json.RawMessage) bool {
+	var m map[string]interface{}
+	if err := json.Unmarshal(raw, &m); err != nil || m == nil {
+		return false
+	}
+
+	deviceID := anyToString(m["deviceID"])
+	if deviceID == "" {
+		deviceID = anyToString(m["deviceId"])
+	}
+	if deviceID == "" {
+		return false
+	}
+
+	dtu := anyToString(m["dtu"])
+	if dtu == "" {
+		if loc, ok := m["location"].(map[string]interface{}); ok {
+			dtu = anyToString(loc["dtu"])
+		}
+	}
+	if dtu == "" {
+		if pl, ok := m["payload"].(map[string]interface{}); ok {
+			dtu = anyToString(pl["dtu"])
+		}
+	}
+
+	deviceName := ""
+	var reportMs int64
+	if ext, ok := m["ext"].(map[string]interface{}); ok {
+		deviceName = anyToString(ext["deviceName"])
+		reportMs = anyToInt64(ext["reportTime"])
+	}
+	if deviceName == "" {
+		deviceName = anyToString(m["deviceName"])
+	}
+	nodeID := anyToString(m["nodeID"])
+	if nodeID == "" {
+		nodeID = anyToString(m["nodeId"])
+	}
+
+	now := time.Now()
+
+	delaySec := int64(0)
+	if dtu != "" {
+		if t, ok := parseDTU(dtu); ok {
+			delaySec = int64(now.Sub(t).Seconds())
+		}
+	} else if reportMs > 0 {
+		if t, ok := reportTimeToTime(reportMs); ok {
+			delaySec = int64(now.Sub(t).Seconds())
+		}
+	}
+
+	var reasons []string
+	if arr, ok := m["storage"].([]interface{}); ok {
+		for _, it := range arr {
+			if sm, ok := it.(map[string]interface{}); ok {
+				if anyToString(sm["free"]) == "0" {
+					reasons = append(reasons, "storage_full")
+					break
+				}
+			}
+		}
+	}
+	if delaySec >= int64(s.cfg.DelayThresholdSec) {
+		reasons = append(reasons, "stale_timestamp")
+	}
+
+	s.mu.Lock()
+	s.lastSeen[deviceID] = now
+	if deviceName != "" {
+		s.deviceName[deviceID] = deviceName
+	}
+	if dtu != "" {
+		s.lastDTU[deviceID] = dtu
+	}
+	if reportMs > 0 {
+		s.lastReportMs[deviceID] = reportMs
+	}
+	s.mu.Unlock()
+
+	p := statusPayload{
+		DeviceID: deviceID,
+		NodeID:   nodeID,
+		DTU:      dtu,
+	}
+	p.Ext.DeviceName = deviceName
+	p.Ext.ReportTime = reportMs
+
+	s.upsertLive(p, "80003", delaySec, false, reasons, now, time.Time{})
+
+	s.persistDelaySample(p, delaySec, now, "80003")
+
+	if s.trafficTotal%200 == 0 || delaySec < -5 || delaySec > 120 {
+		log.Printf(
+			"[VSS-INGEST] 80003 device=%s name=%q dtu=%q delay=%ds lastSeen=now",
+			deviceID, deviceName, dtu, delaySec,
+		)
+	}
+	return true
+}
+
+func anyToString(v interface{}) string {
+	switch t := v.(type) {
+	case string:
+		return strings.TrimSpace(t)
+	case float64:
+		if t == float64(int64(t)) {
+			return fmt.Sprintf("%d", int64(t))
+		}
+		return fmt.Sprintf("%v", t)
+	case json.Number:
+		return t.String()
+	case int:
+		return fmt.Sprintf("%d", t)
+	case int64:
+		return fmt.Sprintf("%d", t)
+	default:
+		if v == nil {
+			return ""
+		}
+		return strings.TrimSpace(fmt.Sprintf("%v", v))
+	}
+}
+
+func anyToInt64(v interface{}) int64 {
+	switch t := v.(type) {
+	case float64:
+		return int64(t)
+	case json.Number:
+		n, _ := t.Int64()
+		return n
+	case int64:
+		return t
+	case int:
+		return int64(t)
+	case string:
+		var n int64
+		fmt.Sscanf(strings.TrimSpace(t), "%d", &n)
+		return n
+	default:
+		return 0
 	}
 }
 
@@ -911,43 +1155,57 @@ func (s *vssMonitorService) tryUpsertFromAny(action string, raw json.RawMessage)
 		return false
 	}
 
-	deviceID, _ := m["deviceID"].(string)
+	deviceID := anyToString(m["deviceID"])
 	if deviceID == "" {
-		deviceID, _ = m["deviceId"].(string)
+		deviceID = anyToString(m["deviceId"])
 	}
 	if deviceID == "" {
 		return false
 	}
 
-	dtu, _ := m["dtu"].(string)
+	dtu := anyToString(m["dtu"])
 	if dtu == "" {
 		if loc, ok := m["location"].(map[string]interface{}); ok {
-			dtu, _ = loc["dtu"].(string)
+			dtu = anyToString(loc["dtu"])
 		}
 	}
 	if dtu == "" {
 		if pl, ok := m["payload"].(map[string]interface{}); ok {
-			dtu, _ = pl["dtu"].(string)
+			dtu = anyToString(pl["dtu"])
 		}
 	}
 
 	deviceName := ""
 	var reportMs int64
 	if ext, ok := m["ext"].(map[string]interface{}); ok {
-		deviceName, _ = ext["deviceName"].(string)
-		if rt, ok := ext["reportTime"].(float64); ok {
-			reportMs = int64(rt)
-		}
+		deviceName = anyToString(ext["deviceName"])
+		reportMs = anyToInt64(ext["reportTime"])
 	}
 	if deviceName == "" {
-		deviceName, _ = m["deviceName"].(string)
-	}
-
-	if dtu == "" && reportMs <= 0 {
-		return false
+		deviceName = anyToString(m["deviceName"])
 	}
 
 	now := time.Now()
+
+	if dtu == "" && reportMs <= 0 {
+		s.mu.Lock()
+		s.lastSeen[deviceID] = now
+		if deviceName != "" {
+			s.deviceName[deviceID] = deviceName
+		}
+		if prev, ok := s.live[deviceID]; ok && prev != nil {
+			prev.LastSeen = now.UTC().Format(time.RFC3339)
+			prev.Action = action
+			prev.Reasons = nil
+			if prev.Status == "STALE" || prev.Status == "OFFLINE" {
+				prev.Status = "NORMAL"
+			}
+			s.liveDirty = true
+		}
+		s.mu.Unlock()
+		return true
+	}
+
 	p := statusPayload{
 		DeviceID: deviceID,
 		DTU:      dtu,
@@ -1124,12 +1382,6 @@ func (s *vssMonitorService) persistIfNotSpam(
 		return
 	}
 
-	dedupeWindow := 15 * time.Minute
-	exists, err := s.repo.ExistsRecent(p.DeviceID, reason, dedupeWindow)
-	if err != nil || exists {
-		return
-	}
-
 	loc, _ := time.LoadLocation("Asia/Jakarta")
 	if loc == nil {
 		loc = time.FixedZone("WIB", 7*3600)
@@ -1158,17 +1410,12 @@ func (s *vssMonitorService) persistIfNotSpam(
 		EventType:   eventType,
 	}
 
-	if err := s.repo.Append(ev); err != nil {
-		log.Printf("[VSS] write log file error: %v", err)
+	if s.eventCh == nil {
 		return
 	}
-
-	if s.reasonAllowedForLog(reason) {
-		s.saveHistory(ev)
-	}
-
-	if s.reasonAllowedForEmail(reason) {
-		s.enqueueAlert(ev)
+	select {
+	case s.eventCh <- ev:
+	default:
 	}
 }
 
@@ -1224,24 +1471,13 @@ func (s *vssMonitorService) persistDelaySample(
 		Reason:     sampleReason,
 	})
 
-	exists, err := s.repo.ExistsRecent(p.DeviceID, sampleReason, sampleLogWindow)
-	if err != nil || exists {
-		return
-	}
-
 	loc, _ := time.LoadLocation("Asia/Jakarta")
 	if loc == nil {
 		loc = time.FixedZone("WIB", 7*3600)
 	}
-	detected := now.In(loc).Format(time.RFC3339)
-
-	msg := fmt.Sprintf(
-		"VSS | sample | action=%s | device=%s (%s) | delay=%ds | dtu=%s",
-		action, p.DeviceID, p.Ext.DeviceName, delaySec, p.DTU,
-	)
 
 	ev := domain.VSSDelayEvent{
-		DetectedAt: detected,
+		DetectedAt: now.In(loc).Format(time.RFC3339),
 		DeviceID:   p.DeviceID,
 		DeviceName: p.Ext.DeviceName,
 		NodeID:     p.NodeID,
@@ -1250,11 +1486,101 @@ func (s *vssMonitorService) persistDelaySample(
 		IsLater:    p.IsLater == "1" || p.Ext.IsLater,
 		DelaySec:   delaySec,
 		Reason:     sampleReason,
-		Message:    msg,
-		Action:     action,
+		Message: fmt.Sprintf(
+			"VSS | sample | action=%s | device=%s (%s) | delay=%ds | dtu=%s",
+			action, p.DeviceID, p.Ext.DeviceName, delaySec, p.DTU,
+		),
+		Action: action,
 	}
-	if err := s.repo.Append(ev); err != nil {
-		log.Printf("[VSS] write delay sample error: %v", err)
+
+	if s.sampleCh == nil {
+		return
+	}
+	select {
+	case s.sampleCh <- ev:
+	default:
+	}
+}
+
+func (s *vssMonitorService) sampleWriterLoop(ctx context.Context) {
+	ticker := time.NewTicker(1 * time.Second)
+	defer ticker.Stop()
+
+	buf := make([]domain.VSSDelayEvent, 0, 512)
+
+	flush := func() {
+		for _, ev := range buf {
+			exists, err := s.repo.ExistsRecent(ev.DeviceID, ev.Reason, sampleLogWindow)
+			if err != nil || exists {
+				continue
+			}
+			if err := s.repo.Append(ev); err != nil {
+				log.Printf("[VSS] write delay sample error: %v", err)
+			}
+		}
+		buf = buf[:0]
+	}
+
+	for {
+		select {
+		case <-ctx.Done():
+			flush()
+			return
+		case ev := <-s.sampleCh:
+			buf = append(buf, ev)
+			if len(buf) >= 500 {
+				flush()
+			}
+		case <-ticker.C:
+			if len(buf) > 0 {
+				flush()
+			}
+		}
+	}
+}
+
+func (s *vssMonitorService) eventWriterLoop(ctx context.Context) {
+	ticker := time.NewTicker(1 * time.Second)
+	defer ticker.Stop()
+
+	buf := make([]domain.VSSDelayEvent, 0, 256)
+	const dedupeWindow = 15 * time.Minute
+
+	flush := func() {
+		for _, ev := range buf {
+			exists, err := s.repo.ExistsRecent(ev.DeviceID, ev.Reason, dedupeWindow)
+			if err != nil || exists {
+				continue
+			}
+			if err := s.repo.Append(ev); err != nil {
+				log.Printf("[VSS] write log file error: %v", err)
+				continue
+			}
+			if s.reasonAllowedForLog(ev.Reason) {
+				s.saveHistory(ev)
+			}
+			if s.reasonAllowedForEmail(ev.Reason) {
+				s.enqueueAlert(ev)
+			}
+		}
+		buf = buf[:0]
+	}
+
+	for {
+		select {
+		case <-ctx.Done():
+			flush()
+			return
+		case ev := <-s.eventCh:
+			buf = append(buf, ev)
+			if len(buf) >= 200 {
+				flush()
+			}
+		case <-ticker.C:
+			if len(buf) > 0 {
+				flush()
+			}
+		}
 	}
 }
 
@@ -1279,7 +1605,7 @@ func (s *vssMonitorService) saveSystemEvent(reason, message string) error {
 }
 
 func (s *vssMonitorService) staleChecker(ctx context.Context) {
-	ticker := time.NewTicker(30 * time.Second)
+	ticker := time.NewTicker(15 * time.Second)
 	defer ticker.Stop()
 
 	threshold := time.Duration(s.cfg.StaleThresholdSec) * time.Second
@@ -1290,68 +1616,56 @@ func (s *vssMonitorService) staleChecker(ctx context.Context) {
 			return
 		case <-ticker.C:
 			now := time.Now()
+
 			s.mu.Lock()
-			snapshot := make(map[string]time.Time, len(s.lastSeen))
-			for k, v := range s.lastSeen {
-				snapshot[k] = v
+			ids := make([]string, 0, len(s.lastSeen))
+			for id := range s.lastSeen {
+				ids = append(ids, id)
 			}
 			s.mu.Unlock()
 
-			for deviceID, last := range snapshot {
-				gap := now.Sub(last)
-				if gap < threshold {
+			for _, deviceID := range ids {
+				s.mu.Lock()
+				last, ok := s.lastSeen[deviceID]
+				if !ok || now.Sub(last) < threshold {
+					s.mu.Unlock()
 					continue
 				}
+				prev := s.live[deviceID]
+				var delaySec int64
+				var dtu string
+				var reportMs int64
+				name := deviceID
+				if prev != nil {
+					delaySec = prev.DelaySec
+					dtu = prev.DTU
+					reportMs = prev.ReportTime
+					if prev.DeviceName != "" {
+						name = prev.DeviceName
+					}
+				}
+				if n, ok := s.deviceName[deviceID]; ok && n != "" {
+					name = n
+				}
+				if dtu == "" {
+					dtu = s.lastDTU[deviceID]
+				}
+				if reportMs == 0 {
+					reportMs = s.lastReportMs[deviceID]
+				}
+				lastCopy := last
+				s.mu.Unlock()
+
 				if !s.reasonAllowedForLog("no_heartbeat") {
 					continue
 				}
 
-				name := deviceID
-				dtu := ""
-				var reportMs int64
-				var delaySec int64
-
-				s.mu.Lock()
-				if n, ok := s.deviceName[deviceID]; ok && n != "" {
-					name = n
-				}
-				if v, ok := s.lastDTU[deviceID]; ok {
-					dtu = v
-				}
-				if v, ok := s.lastReportMs[deviceID]; ok {
-					reportMs = v
-				}
-				if prev, ok := s.live[deviceID]; ok && prev != nil {
-					delaySec = prev.DelaySec
-				} else if t, ok := parseDTU(dtu); ok {
-					d := now.Sub(t).Seconds()
-					if d < 0 {
-						d = 0
-					}
-					delaySec = int64(d)
-				}
-				s.mu.Unlock()
-
-				fake := statusPayload{
-					DeviceID: deviceID,
-					DTU:      dtu,
-				}
+				fake := statusPayload{DeviceID: deviceID, DTU: dtu}
 				fake.Ext.DeviceName = name
 				fake.Ext.ReportTime = reportMs
 
-				s.upsertLive(fake, "stale", delaySec, false, []string{"no_heartbeat"}, now, last)
-
-				s.persistIfNotSpam(
-					fake,
-					"no_heartbeat",
-					delaySec,
-					false,
-					now,
-					"stale",
-					"",
-					"",
-					"",
-				)
+				s.upsertLive(fake, "stale", delaySec, false, []string{"no_heartbeat"}, now, lastCopy)
+				s.persistIfNotSpam(fake, "no_heartbeat", delaySec, false, now, "stale", "", "", "")
 			}
 		}
 	}
@@ -1726,6 +2040,138 @@ func (s *vssMonitorService) logCleanup(ctx context.Context) {
 	}
 }
 
+func (s *vssMonitorService) loadLiveSnapshot() {
+	if s.snapshotPath == "" {
+		return
+	}
+	b, err := os.ReadFile(s.snapshotPath)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			log.Printf("[VSS] load snapshot: %v", err)
+		}
+		return
+	}
+	var snap liveSnapshotFile
+	if err := json.Unmarshal(b, &snap); err != nil {
+		log.Printf("[VSS] snapshot corrupt: %v", err)
+		return
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	for _, d := range snap.Devices {
+		cp := d
+		if cp.DeviceID == "" {
+			continue
+		}
+		s.live[cp.DeviceID] = &cp
+		if cp.DeviceName != "" {
+			s.deviceName[cp.DeviceID] = cp.DeviceName
+		}
+		if cp.DTU != "" {
+			s.lastDTU[cp.DeviceID] = cp.DTU
+		}
+		if cp.ReportTime > 0 {
+			s.lastReportMs[cp.DeviceID] = cp.ReportTime
+		}
+	}
+	for id, ts := range snap.LastSeen {
+		if t, err := time.Parse(time.RFC3339, ts); err == nil {
+			s.lastSeen[id] = t
+		}
+	}
+	for id, dtu := range snap.LastDTU {
+		if dtu != "" {
+			s.lastDTU[id] = dtu
+		}
+	}
+	for id, ms := range snap.LastReportMs {
+		if ms > 0 {
+			s.lastReportMs[id] = ms
+		}
+	}
+	for id, name := range snap.DeviceName {
+		if name != "" {
+			s.deviceName[id] = name
+		}
+	}
+	log.Printf("[VSS] live snapshot loaded devices=%d saved_at=%s", len(s.live), snap.SavedAt)
+}
+
+func (s *vssMonitorService) saveLiveSnapshot() {
+	if s.snapshotPath == "" {
+		return
+	}
+
+	s.mu.Lock()
+	if !s.liveDirty && len(s.live) == 0 {
+		s.mu.Unlock()
+		return
+	}
+	s.liveDirty = false
+
+	devices := make([]VSSDeviceLive, 0, len(s.live))
+	for _, v := range s.live {
+		if v == nil {
+			continue
+		}
+		devices = append(devices, *v)
+	}
+	lastSeen := make(map[string]string, len(s.lastSeen))
+	for id, t := range s.lastSeen {
+		lastSeen[id] = t.UTC().Format(time.RFC3339)
+	}
+	lastDTU := copyStringMap(s.lastDTU)
+	lastReport := copyInt64Map(s.lastReportMs)
+	names := copyStringMap(s.deviceName)
+	s.mu.Unlock()
+
+	snap := liveSnapshotFile{
+		SavedAt:      time.Now().In(jakartaTZ).Format(time.RFC3339),
+		Devices:      devices,
+		LastSeen:     lastSeen,
+		LastDTU:      lastDTU,
+		LastReportMs: lastReport,
+		DeviceName:   names,
+	}
+	b, err := json.Marshal(snap)
+	if err != nil {
+		log.Printf("[VSS] snapshot marshal: %v", err)
+		return
+	}
+	tmp := s.snapshotPath + ".tmp"
+	if err := os.WriteFile(tmp, b, 0o644); err != nil {
+		log.Printf("[VSS] snapshot write: %v", err)
+		return
+	}
+	if err := os.Rename(tmp, s.snapshotPath); err != nil {
+		log.Printf("[VSS] snapshot rename: %v", err)
+	}
+}
+
+func copyStringMap(m map[string]string) map[string]string {
+	out := make(map[string]string, len(m))
+	for k, v := range m {
+		out[k] = v
+	}
+	return out
+}
+
+func (s *vssMonitorService) snapshotLoop(ctx context.Context) {
+	ticker := time.NewTicker(15 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			s.saveLiveSnapshot()
+			return
+		case <-ticker.C:
+			s.saveLiveSnapshot()
+		}
+	}
+}
+
 func (s *vssMonitorService) purgeOldLogs() {
 	days := s.cfg.LogRetentionDays
 	if days <= 0 {
@@ -1861,6 +2307,8 @@ func (s *vssMonitorService) upsertLive(
 		CPU:          cpu,
 		StorageFree:  storageFree,
 	}
+
+	s.liveDirty = true
 }
 
 func containsStr(ss []string, v string) bool {

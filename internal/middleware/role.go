@@ -42,9 +42,15 @@ func DenyRoles(denied ...string) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		role := strings.ToLower(strings.TrimSpace(getRoleFromContext(c)))
 		if set[role] {
+			msg := "Akses ditolak: role Anda tidak diizinkan untuk aksi ini"
+			if role == RoleGuest {
+				msg = "Akses ditolak: role guest hanya boleh mengakses VSS Monitoring"
+			} else if role == RoleViewer {
+				msg = "Akses ditolak: role viewer hanya boleh melihat data (read-only)"
+			}
 			c.AbortWithStatusJSON(http.StatusForbidden, gin.H{
 				"success": false,
-				"message": "Akses ditolak: role guest hanya boleh mengakses VSS Monitoring",
+				"message": msg,
 			})
 			return
 		}

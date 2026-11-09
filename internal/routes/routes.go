@@ -37,32 +37,41 @@ func SetupRoutes(r *gin.Engine, reportHandler *handler.ReportHandler, userHandle
 
 	reports := nonGuest.Group("/reports")
 	{
-		reports.POST("", reportHandler.CreateReport)
-		reports.POST("/", reportHandler.CreateReport)
 		reports.GET("", reportHandler.GetAllReports)
 		reports.GET("/", reportHandler.GetAllReports)
 		reports.GET("/export", reportHandler.ExportExcel)
 		reports.GET("/export-count", reportHandler.ExportCount)
 		reports.GET("/:uuid", reportHandler.GetReportByUUID)
-		reports.PUT("/:uuid", reportHandler.UpdateReport)
-		reports.DELETE("/:uuid", reportHandler.DeleteReport)
-		reports.POST("/:uuid/restore", reportHandler.MarkRestored)
-		reports.POST("/:uuid/toggle-handled", reportHandler.ToggleHandled)
-		reports.POST("/:uuid/rca/export", reportHandler.ExportRCA)
-
 		reports.GET("/:uuid/comments", commentHandler.GetComments)
-		reports.POST("/:uuid/comments", commentHandler.AddComment)
-		reports.DELETE("/:uuid/comments/:commentId", commentHandler.DeleteComment)
+
+		reportsWrite := reports.Group("")
+		reportsWrite.Use(middleware.DenyRoles(middleware.RoleViewer))
+		{
+			reportsWrite.POST("", reportHandler.CreateReport)
+			reportsWrite.POST("/", reportHandler.CreateReport)
+			reportsWrite.PUT("/:uuid", reportHandler.UpdateReport)
+			reportsWrite.DELETE("/:uuid", reportHandler.DeleteReport)
+			reportsWrite.POST("/:uuid/restore", reportHandler.MarkRestored)
+			reportsWrite.POST("/:uuid/toggle-handled", reportHandler.ToggleHandled)
+			reportsWrite.POST("/:uuid/rca/export", reportHandler.ExportRCA)
+			reportsWrite.POST("/:uuid/comments", commentHandler.AddComment)
+			reportsWrite.DELETE("/:uuid/comments/:commentId", commentHandler.DeleteComment)
+		}
 	}
 
 	externalTeams := nonGuest.Group("/report-external-teams")
 	{
 		externalTeams.GET("", externalTeamHandler.GetByReportID)
 		externalTeams.GET("/", externalTeamHandler.GetByReportID)
-		externalTeams.POST("", externalTeamHandler.CreateExternalTeam)
-		externalTeams.POST("/", externalTeamHandler.CreateExternalTeam)
-		externalTeams.PUT("/:id", externalTeamHandler.UpdateExternalTeam)
-		externalTeams.DELETE("/:id", externalTeamHandler.DeleteExternalTeam)
+
+		externalWrite := externalTeams.Group("")
+		externalWrite.Use(middleware.DenyRoles(middleware.RoleViewer))
+		{
+			externalWrite.POST("", externalTeamHandler.CreateExternalTeam)
+			externalWrite.POST("/", externalTeamHandler.CreateExternalTeam)
+			externalWrite.PUT("/:id", externalTeamHandler.UpdateExternalTeam)
+			externalWrite.DELETE("/:id", externalTeamHandler.DeleteExternalTeam)
+		}
 	}
 
 	masters := nonGuest.Group("/master")
