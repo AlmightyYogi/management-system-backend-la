@@ -208,7 +208,7 @@ func NewVSSMonitorService(repo repository.VSSDelayRepository, historyRepo reposi
 		live: 			make(map[string]*VSSDeviceLive),
 		trafficByAction: make(map[string]int64),
 		currentCounts:   make(map[string]int64),
-		minuteHistory:   make([]MinuteTraffic, 0, 60),
+		minuteHistory:   make([]MinuteTraffic, 0, 24*60),
 		recentSamples:   make(map[string][]delaySamplePoint),
 		sampleCh:        make(chan domain.VSSDelayEvent, 10000),
 		eventCh:         make(chan domain.VSSDelayEvent, 5000),
@@ -585,6 +585,19 @@ func (s *vssMonitorService) GetDaySummary(date string) (*domain.VSSDaySummary, e
 	byDevice := map[string]*agg{}
 
 	for _, ev := range events {
+		switch strings.ToLower(ev.Reason) {
+		case "delayed", "stale_timestamp", "delay_sample":
+		default:
+			continue
+		}
+		abs := ev.DelaySec
+		if abs < 0 {
+			abs = -abs
+		}
+		if abs >= 3600 {
+			continue
+		}
+
 		a, ok := byDevice[ev.DeviceID]
 		if !ok {
 			a = &agg{name: ev.DeviceName}
@@ -610,7 +623,7 @@ func (s *vssMonitorService) GetDaySummary(date string) (*domain.VSSDaySummary, e
 		a.n++
 	}
 
-		const minAvgDelaySec int64 = 3
+	const minAvgDelaySec int64 = 3
 
 	type deviceStat struct {
 		id     string
@@ -1250,6 +1263,30 @@ func (s *vssMonitorService) tryUpsertFromAny(action string, raw json.RawMessage)
 		reasons = append(reasons, "stale_timestamp")
 	}
 
+	isLater := false
+	if v, ok := m["isLater"]; ok {
+		switch t := v.(type) {
+		case string:
+			isLater = t == "1" || strings.EqualFold(t, "true")
+		case float64:
+			isLater = t != 0
+		case bool:
+			isLater = t
+		}
+	}
+	if !isLater {
+		if ext, ok := m["ext"].(map[string]interface{}); ok {
+			if b, ok := ext["isLater"].(bool); ok {
+				isLater = b
+			} else if s, ok := ext["isLater"].(string); ok {
+				isLater = s == "1" || strings.EqualFold(s, "true")
+			}
+		}
+	}
+	if isLater {
+		reasons = append(reasons, "delayed")
+	}
+
 	s.mu.Lock()
 	s.lastSeen[deviceID] = now
 	if deviceName != "" {
@@ -1263,8 +1300,9 @@ func (s *vssMonitorService) tryUpsertFromAny(action string, raw json.RawMessage)
 	}
 	s.mu.Unlock()
 
-	s.upsertLive(p, action, delaySec, false, reasons, now, time.Time{})
+	s.upsertLive(p, action, delaySec, isLater, reasons, now, time.Time{})
 	s.persistDelaySample(p, delaySec, now, action)
+	s.recordPacketDelayEvidence(p, delaySec, now, action, isLater)
 	return true
 }
 
@@ -1314,8 +1352,9 @@ func (s *vssMonitorService) recordTraffic(action string) {
 			Counts: copyInt64Map(s.currentCounts),
 			Total:  sumInt64Map(s.currentCounts),
 		})
-		if len(s.minuteHistory) > 60 {
-			s.minuteHistory = s.minuteHistory[len(s.minuteHistory)-60:]
+		const maxMinuteHistory = 24 * 60
+		if len(s.minuteHistory) > maxMinuteHistory {
+			s.minuteHistory = s.minuteHistory[len(s.minuteHistory)-maxMinuteHistory:]
 		}
 		s.currentMinute = minuteKey
 		s.currentCounts = make(map[string]int64)
@@ -1325,6 +1364,14 @@ func (s *vssMonitorService) recordTraffic(action string) {
 		s.currentCounts = make(map[string]int64)
 	}
 	s.currentCounts[action]++
+}
+
+func historyDelaySec(dtuStr string, detectedAt time.Time) (int64, bool) {
+	t, ok := parseDTU(dtuStr)
+	if !ok {
+		return 0, false
+	}
+	return int64(t.Sub(detectedAt).Seconds()), true
 }
 
 func (s *vssMonitorService) computeDelaySec(p statusPayload, now time.Time) int64 {
@@ -1386,11 +1433,24 @@ func (s *vssMonitorService) persistIfNotSpam(
 	if loc == nil {
 		loc = time.FixedZone("WIB", 7*3600)
 	}
-	detected := now.In(loc).Format(time.RFC3339)
+	detectedAt := now.In(loc)
+	detected := detectedAt.Format(time.RFC3339)
+
+	storedDelay := delaySec
+	metric := "delay_packet_sec"
+	switch reason {
+	case "no_heartbeat":
+		metric = "silent_for_sec"
+	case "delayed", "stale_timestamp", "delay_sample":
+		if d, ok := historyDelaySec(p.DTU, detectedAt); ok {
+			storedDelay = d
+		}
+		metric = "dtu_minus_detected_sec"
+	}
 
 	msg := fmt.Sprintf(
-		"VSS | action=%s | device=%s (%s) | reason=%s | delay=%ds | dtu=%s | alarmId=%s | detail=%s",
-		action, p.DeviceID, p.Ext.DeviceName, reason, delaySec, p.DTU, alarmID, alarmDetail,
+		"VSS | action=%s | device=%s (%s) | reason=%s | %s=%d | dtu=%s | detected=%s | alarmId=%s | detail=%s",
+		action, p.DeviceID, p.Ext.DeviceName, reason, metric, storedDelay, p.DTU, detected, alarmID, alarmDetail,
 	)
 
 	ev := domain.VSSDelayEvent{
@@ -1401,7 +1461,7 @@ func (s *vssMonitorService) persistIfNotSpam(
 		DTU:         p.DTU,
 		ReportTime:  p.Ext.ReportTime,
 		IsLater:     isLater,
-		DelaySec:    delaySec,
+		DelaySec:    storedDelay,
 		Reason:      reason,
 		Message:     msg,
 		Action:      action,
@@ -1417,6 +1477,35 @@ func (s *vssMonitorService) persistIfNotSpam(
 	case s.eventCh <- ev:
 	default:
 	}
+}
+
+func (s *vssMonitorService) recordPacketDelayEvidence(p statusPayload, delaySec int64, now time.Time, action string, isLater bool) {
+	th := int64(s.cfg.DelayThresholdSec)
+	if th <= 0 {
+		th = 60
+	}
+
+	histDelay := delaySec
+	if d, ok := historyDelaySec(p.DTU, now); ok {
+		histDelay = d
+	}
+
+	abs := histDelay
+	if abs < 0 {
+		abs = -abs
+	}
+	if abs >= 3600 {
+		return
+	}
+	if abs < th && !isLater {
+		return
+	}
+
+	reason := "delayed"
+	if abs >= th {
+		reason = "stale_timestamp"
+	}
+	s.persistIfNotSpam(p, reason, histDelay, isLater, now, action, "", "", "")
 }
 
 const (
@@ -1463,10 +1552,22 @@ func (s *vssMonitorService) persistDelaySample(
 		return
 	}
 
+	sampleDelay := delaySec
+	if d, ok := historyDelaySec(p.DTU, now); ok {
+		sampleDelay = d
+	}
+	absSample := sampleDelay
+	if absSample < 0 {
+		absSample = -absSample
+	}
+	if absSample >= 3600 {
+		return
+	}
+
 	s.pushRecentSample(p.DeviceID, delaySamplePoint{
 		ReceivedAt: now,
 		DTU:        p.DTU,
-		DelaySec:   delaySec,
+		DelaySec:   sampleDelay,
 		Action:     action,
 		Reason:     sampleReason,
 	})
@@ -1484,11 +1585,11 @@ func (s *vssMonitorService) persistDelaySample(
 		DTU:        p.DTU,
 		ReportTime: p.Ext.ReportTime,
 		IsLater:    p.IsLater == "1" || p.Ext.IsLater,
-		DelaySec:   delaySec,
+		DelaySec:   sampleDelay,
 		Reason:     sampleReason,
 		Message: fmt.Sprintf(
-			"VSS | sample | action=%s | device=%s (%s) | delay=%ds | dtu=%s",
-			action, p.DeviceID, p.Ext.DeviceName, delaySec, p.DTU,
+			"VSS | sample | action=%s | device=%s (%s) | dtu_minus_detected=%ds | dtu=%s",
+			action, p.DeviceID, p.Ext.DeviceName, sampleDelay, p.DTU,
 		),
 		Action: action,
 	}
@@ -1609,6 +1710,9 @@ func (s *vssMonitorService) staleChecker(ctx context.Context) {
 	defer ticker.Stop()
 
 	threshold := time.Duration(s.cfg.StaleThresholdSec) * time.Second
+	if threshold <= 0 {
+		threshold = 5 * time.Minute
+	}
 
 	for {
 		select {
@@ -1627,17 +1731,23 @@ func (s *vssMonitorService) staleChecker(ctx context.Context) {
 			for _, deviceID := range ids {
 				s.mu.Lock()
 				last, ok := s.lastSeen[deviceID]
-				if !ok || now.Sub(last) < threshold {
+				if !ok {
 					s.mu.Unlock()
 					continue
 				}
+				silentFor := now.Sub(last)
+				if silentFor < threshold {
+					s.mu.Unlock()
+					continue
+				}
+
 				prev := s.live[deviceID]
-				var delaySec int64
+				var lastPacketDelay int64
 				var dtu string
 				var reportMs int64
 				name := deviceID
 				if prev != nil {
-					delaySec = prev.DelaySec
+					lastPacketDelay = prev.DelaySec
 					dtu = prev.DTU
 					reportMs = prev.ReportTime
 					if prev.DeviceName != "" {
@@ -1656,16 +1766,27 @@ func (s *vssMonitorService) staleChecker(ctx context.Context) {
 				lastCopy := last
 				s.mu.Unlock()
 
+				fake := statusPayload{DeviceID: deviceID, DTU: dtu}
+				fake.Ext.DeviceName = name
+				fake.Ext.ReportTime = reportMs
+				s.upsertLive(fake, "stale", lastPacketDelay, false, []string{"no_heartbeat"}, now, lastCopy)
+
 				if !s.reasonAllowedForLog("no_heartbeat") {
 					continue
 				}
 
-				fake := statusPayload{DeviceID: deviceID, DTU: dtu}
-				fake.Ext.DeviceName = name
-				fake.Ext.ReportTime = reportMs
-
-				s.upsertLive(fake, "stale", delaySec, false, []string{"no_heartbeat"}, now, lastCopy)
-				s.persistIfNotSpam(fake, "no_heartbeat", delaySec, false, now, "stale", "", "", "")
+				silentSec := int64(silentFor.Seconds())
+				s.persistIfNotSpam(
+					fake,
+					"no_heartbeat",
+					silentSec,
+					false,
+					now,
+					"stale",
+					"",
+					"",
+					"",
+				)
 			}
 		}
 	}
@@ -1981,10 +2102,20 @@ func (s *vssMonitorService) saveHistory(ev domain.VSSDelayEvent) {
 		return
 	}
 
-	cooldown := time.Duration(s.cfg.EmailCooldownMin) * time.Minute
-	if cooldown <= 0 {
-		cooldown = 15 * time.Minute
+	cooldown := 15 * time.Minute
+	switch strings.ToLower(ev.Reason) {
+	case "delayed", "stale_timestamp":
+		cooldown = 10 * time.Minute
+	case "no_heartbeat":
+		cooldown = 2 * time.Hour
+	case "disconnect":
+		cooldown = 30 * time.Minute
+	default:
+		if s.cfg.EmailCooldownMin > 0 {
+			cooldown = time.Duration(s.cfg.EmailCooldownMin) * time.Minute
+		}
 	}
+
 	exists, err := s.historyRepo.ExistsRecent(ev.DeviceID, ev.Reason, cooldown)
 	if err != nil || exists {
 		return
@@ -2023,7 +2154,8 @@ func (s *vssMonitorService) saveHistory(ev domain.VSSDelayEvent) {
 		log.Printf("[VSS] save history error: %v", err)
 		return
 	}
-	log.Printf("[VSS] history saved device=%s reason=%s month=%s", h.DeviceID, h.Reason, h.YearMonth)
+	log.Printf("[VSS] history saved device=%s reason=%s delaySec=%d month=%s",
+		h.DeviceID, h.Reason, h.DelaySec, h.YearMonth)
 }
 
 func (s *vssMonitorService) logCleanup(ctx context.Context) {
